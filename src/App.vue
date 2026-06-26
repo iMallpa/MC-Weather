@@ -193,6 +193,7 @@ const overviewMetrics = computed(() => [
 ])
 watch(darkMode, (value) => {
   document.documentElement.dataset.theme = value ? 'dark' : 'light'
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', value ? '#141C17' : '#EFEDDB')
   drawRoadBackdrop()
   renderMinuteChart()
   updateLeafletMap()
@@ -726,7 +727,7 @@ function drawRoadBackdrop() {
   ctx.lineCap = 'square'
   const isWideCanvas = width > 1180
   const roadOffsetX = isWideCanvas ? 200 : 0
-  const roadOffsetY = isWideCanvas ? -100 : 0
+  const roadOffsetY = isWideCanvas ? -100 : -150
   
   const gradient = ctx.createLinearGradient(width, 0, 0, height)
   gradient.addColorStop(0, isDark ? 'rgba(36,96,42,0.42)' : 'rgba(18,48,34,0.46)')
@@ -1060,7 +1061,10 @@ function rounded(value, digits = 0) {
               </button>
             </div>
             <div ref="mapElement" class="leaflet-map"></div>
-            <p v-if="!owmApiKey" class="map-note">在设置里输入 OWM Key 后启用 OpenWeatherMap 图层</p>
+            <p v-if="!owmApiKey" class="map-note">
+              在设置里输入 OWM Key 后启用 OpenWeatherMap 图层。
+              <a href="https://openweathermap.org/api" target="_blank" rel="noreferrer">获取 API Key</a>
+            </p>
           </div>
         </McPanel>
       </section>
