@@ -9,7 +9,8 @@ import { DEFAULT_PLACE, loadWeather, reverseGeocodePlace, searchPlaces } from '.
 Chart.register(...registerables)
 
 const DEFAULT_PLACE_KEY = 'mc-weather-default-place'
-const DEFAULT_SKIN = '/skin-default.png'
+const assetUrl = (path) => `${import.meta.env.BASE_URL}${path.replace(/^\//, '')}`
+const DEFAULT_SKIN = assetUrl('skin-default.png')
 const refreshOptions = ['5 分钟', '15 分钟', '30 分钟', '60 分钟']
 const refreshOptionValues = [5, 15, 30, 60]
 const skinPoseOptions = ['站立', '行走']
@@ -19,7 +20,7 @@ const themeOptions = [
   { label: '深色', value: 'dark' },
   { label: '自动', value: 'auto' },
 ]
-const loadingSpinnerSrc = '/mcui-oreui/assets/Loading_white.DMpwGoUC.gif'
+const loadingSpinnerSrc = assetUrl('mcui-oreui/assets/Loading_white.DMpwGoUC.gif')
 const owmLayerOptions = [
   { label: '降水', value: 'precipitation_new' },
   { label: '云量', value: 'clouds_new' },
@@ -1231,7 +1232,7 @@ function rounded(value, digits = 0) {
     <footer class="app-footer">
       <div class="footer-inner">
         <div class="footer-brand-row">
-          <img src="/icon.png" alt="" />
+          <img :src="assetUrl('icon.png')" alt="" />
           <div class="footer-brand-copy">
             <strong>MC Weather</strong>
             <span>一款受 Minecraft 启发的像素风格天气应用，把天空装进方块世界。</span>
