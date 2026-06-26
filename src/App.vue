@@ -31,7 +31,7 @@ const owmLayerOptions = [
 
 const tabs = [
   { label: '概览', value: 'current' },
-  { label: '分钟', value: 'minute' },
+  { label: '图表', value: 'minute' },
   { label: '预报', value: 'forecast' },
   { label: '天气建议', value: 'advice' },
 ]
@@ -45,7 +45,9 @@ const autoRefresh = ref(localStorage.getItem('mc-weather-auto-refresh') === 'tru
 const refreshMinutes = ref(Number(localStorage.getItem('mc-weather-refresh-minutes') || 15))
 const owmApiKey = ref(localStorage.getItem('mc-weather-owm-key') || import.meta.env.VITE_OWM_API_KEY || '')
 const owmLayer = ref(localStorage.getItem('mc-weather-owm-layer') || 'precipitation_new')
+const useOpenWeatherData = ref(localStorage.getItem('mc-weather-use-openweather') === 'true')
 const skinModalOpen = ref(false)
+const debugModalOpen = ref(false)
 const skinUrl = ref(localStorage.getItem('mc-weather-skin-url') || DEFAULT_SKIN)
 const skinFileInput = ref(null)
 const skinSlim = ref(localStorage.getItem('mc-weather-skin-slim') === 'true')
@@ -63,7 +65,9 @@ const loading = ref(false)
 const locating = ref(false)
 const error = ref('')
 const minuteCanvas = ref(null)
-const minuteTooltip = ref({ visible: false, x: 0, y: 0, title: '', items: [] })
+const hourlyCanvas = ref(null)
+const windCanvas = ref(null)
+const minuteTooltip = ref({ visible: false, chartId: '', x: 0, y: 0, title: '', items: [] })
 const roadCanvas = ref(null)
 const mapElement = ref(null)
 const roadWays = ref([])
@@ -71,6 +75,8 @@ const roadWays = ref([])
 let searchTimer = 0
 let refreshTimer = 0
 let minuteChart = null
+let hourlyChart = null
+let windChart = null
 let resizeObserver = null
 let leafletMap = null
 let baseLayer = null
@@ -82,6 +88,28 @@ let themeChangeHandler = null
 
 const current = computed(() => weather.value?.current)
 const cei = computed(() => current.value?.cei)
+const openWeatherOptions = computed(() => ({
+  owmApiKey: owmApiKey.value.trim(),
+  useOpenWeather: useOpenWeatherData.value && Boolean(owmApiKey.value.trim()),
+}))
+const weatherAlerts = computed(() => weather.value?.alerts || [])
+const displayedWeatherAlerts = computed(() => {
+  const alerts = [...weatherAlerts.value].filter(Boolean)
+  if (!alerts.length) return []
+  const timeValue = (alert) => new Date(alert.start || alert.end || weather.value?.updatedAt || 0).getTime() || 0
+  const latestTime = Math.max(...alerts.map(timeValue))
+  const latestAlerts = alerts.filter((alert) => timeValue(alert) === latestTime)
+  const seen = new Set()
+  const uniqueAlerts = []
+  for (const alert of latestAlerts) {
+    const key = `${alert.title || ''}|${alert.description || ''}`.trim()
+    if (seen.has(key)) continue
+    seen.add(key)
+    uniqueAlerts.push(alert)
+  }
+  return uniqueAlerts.slice(0, 2)
+})
+const isOpenWeatherSource = computed(() => weather.value?.source === 'openweather')
 const ceiLevelTitle = computed(() => {
   const [title] = String(cei.value?.level || '').split(' - ')
   return title.replace(/^CEI\s+/, '') || '--'
@@ -147,18 +175,34 @@ const riskFactors = computed(() => {
   return (cei.value?.detail.risk.factors ?? []).map((item) => labels[item] ?? item)
 })
 const aqiSummary = computed(() => {
+  const owmAqi = Number(current.value?.air?.openWeatherAqi)
+  if (isOpenWeatherSource.value) {
+    const labels = {
+      1: '优',
+      2: '良',
+      3: '中等',
+      4: '较差',
+      5: '很差',
+    }
+    return {
+      value: Number.isFinite(owmAqi) && owmAqi > 0 ? owmAqi : null,
+      label: labels[owmAqi] || '暂无',
+      scale: 'OWM',
+      bad: owmAqi >= 4,
+    }
+  }
   const aqi = current.value?.air?.europeanAqi || current.value?.air?.usAqi || 0
-  if (aqi <= 20) return { value: aqi, label: '优' }
-  if (aqi <= 40) return { value: aqi, label: '良' }
-  if (aqi <= 60) return { value: aqi, label: '一般' }
-  if (aqi <= 80) return { value: aqi, label: '较差' }
-  return { value: aqi, label: '差' }
+  if (aqi <= 20) return { value: aqi, label: '优', scale: 'AQI', bad: false }
+  if (aqi <= 40) return { value: aqi, label: '良', scale: 'AQI', bad: false }
+  if (aqi <= 60) return { value: aqi, label: '一般', scale: 'AQI', bad: false }
+  if (aqi <= 80) return { value: aqi, label: '较差', scale: 'AQI', bad: true }
+  return { value: aqi, label: '差', scale: 'AQI', bad: true }
 })
 const summaryText = computed(() => {
   if (!current.value || !cei.value) return ''
   const rain = current.value.precipitationProbability >= 50 ? '降水概率偏高，建议带伞。' : '短时降水概率不高。'
   const wind = current.value.windGust * 3.6 >= 25 ? '阵风较明显，注意固定随身物品。' : '风力整体温和。'
-  const air = aqiSummary.value.value >= 60 ? '空气质量一般，敏感人群减少长时间户外活动。' : '空气质量处于可接受范围。'
+  const air = aqiSummary.value.bad ? '空气质量一般，敏感人群减少长时间户外活动。' : '空气质量处于可接受范围。'
   return `${placeTitle.value} 当前 ${current.value.label}，气温 ${rounded(current.value.temp)}°C，体感 ${rounded(current.value.feelsLike)}°C。CEI 为 ${cei.value.cei}，主要影响来自 ${mainEffect.value}。${rain}${wind}${air}`
 })
 const currentBrief = computed(() => {
@@ -191,6 +235,36 @@ const overviewMetrics = computed(() => [
   ['气压', `${rounded(current.value?.pressure)} hPa`],
   ['AQI', `${rounded(aqiSummary.value.value)} ${aqiSummary.value.label}`],
 ])
+const detailMetrics = computed(() => {
+  if (!current.value) return []
+  if (isOpenWeatherSource.value) {
+    return [
+      ['UVI', rounded(current.value.uvi, 1), uvStatus(current.value.uvi)],
+      ['能见度', `${rounded(current.value.visibility / 1000, 1)} km`, visibilityStatus(current.value.visibility)],
+      ['露点', `${rounded(current.value.dewPoint)}°C`, dewPointStatus(current.value.dewPoint)],
+      ['PM2.5 / PM10', `${rounded(current.value.air?.pm25, 1)} / ${rounded(current.value.air?.pm10, 1)}`, particulateStatus(current.value.air)],
+    ]
+  }
+  return [
+    ['UVI', rounded(current.value.uvi, 1), uvStatus(current.value.uvi)],
+    ['能见度', `${rounded(current.value.visibility / 1000, 1)} km`, visibilityStatus(current.value.visibility)],
+    ['日出 - 日落', `${formatTime(weather.value.daily[0]?.sunrise)} - ${formatTime(weather.value.daily[0]?.sunset)}`, `白昼 ${formatDurationHours(weather.value.daily[0]?.daylightDuration)}`],
+    ['短波辐射', `${rounded(current.value.radiation)} W/m²`, radiationStatus(current.value.radiation)],
+  ]
+})
+const minutePanelTitle = computed(() => {
+  if (isOpenWeatherSource.value) return '未来 60 分钟降水表'
+  return '未来 4 小时趋势表'
+})
+const minutePanelSubtitle = computed(() => {
+  if (isOpenWeatherSource.value) return '1 分钟步长 · 降水量'
+  return '15 分钟步长 · 温度与降水'
+})
+const minuteHasPrecipitation = computed(() => (weather.value?.minutely || []).some((item) => Number(item.precipitation) > 0))
+const hourlyStepLabel = computed(() => formatStepLabel(stepMinutes(weather.value?.hourly)))
+const weatherDebug = computed(() => weather.value?.debug || null)
+const debugSeriesRows = computed(() => (weatherDebug.value?.series || []).map(formatDebugSeries))
+const debugRequests = computed(() => (weatherDebug.value?.requests || []).map(formatDebugRequest))
 watch(darkMode, (value) => {
   document.documentElement.dataset.theme = value ? 'dark' : 'light'
   document.querySelector('meta[name="theme-color"]')?.setAttribute('content', value ? '#141C17' : '#EFEDDB')
@@ -216,6 +290,11 @@ watch(refreshMinutes, (value) => {
 watch(owmApiKey, (value) => {
   localStorage.setItem('mc-weather-owm-key', value.trim())
   updateLeafletMap()
+})
+
+watch(useOpenWeatherData, (value) => {
+  localStorage.setItem('mc-weather-use-openweather', String(value))
+  if (owmApiKey.value.trim()) refreshWeather()
 })
 
 watch(owmLayer, (value) => {
@@ -253,7 +332,7 @@ watch(query, (value) => {
   }
   searchTimer = setTimeout(async () => {
     try {
-      places.value = await searchPlaces(value.trim())
+      places.value = await searchPlaces(value.trim(), openWeatherOptions.value)
     } catch (err) {
       error.value = err.message
     }
@@ -276,6 +355,7 @@ onMounted(() => {
   }
   themeMediaQuery.addEventListener?.('change', themeChangeHandler)
   themeMediaQuery.addListener?.(themeChangeHandler)
+  window.addEventListener('keydown', handleGlobalShortcut)
   loadInitialWeather()
   setupAutoRefresh()
   resizeObserver = new ResizeObserver(() => {
@@ -292,20 +372,30 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearInterval(refreshTimer)
   minuteChart?.destroy()
+  hourlyChart?.destroy()
+  windChart?.destroy()
   resizeObserver?.disconnect()
   leafletMap?.remove()
+  window.removeEventListener('keydown', handleGlobalShortcut)
   if (themeMediaQuery && themeChangeHandler) {
     themeMediaQuery.removeEventListener?.('change', themeChangeHandler)
     themeMediaQuery.removeListener?.(themeChangeHandler)
   }
 })
 
+function handleGlobalShortcut(event) {
+  if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 'd') {
+    event.preventDefault()
+    debugModalOpen.value = true
+  }
+}
+
 async function refreshWeather(place = selectedPlace.value) {
   loading.value = true
   error.value = ''
   try {
     selectedPlace.value = place
-    weather.value = await loadWeather(place)
+    weather.value = await loadWeather(place, openWeatherOptions.value)
     scheduleLeafletMap()
     loadRoadNetwork()
   } catch (err) {
@@ -338,7 +428,7 @@ async function chooseFirstPlace() {
   }
   if (term.length >= 2) {
     try {
-      places.value = await searchPlaces(term)
+      places.value = await searchPlaces(term, openWeatherOptions.value)
       if (places.value.length) choosePlace(places.value[0])
       else searchMiss.value = true
     } catch (err) {
@@ -367,7 +457,7 @@ async function refreshWeatherFromCurrentLocation({ fallback = false, silentFallb
     const latitude = Number(position.coords.latitude.toFixed(4))
     const longitude = Number(position.coords.longitude.toFixed(4))
     try {
-      await refreshWeather(await reverseGeocodePlace(latitude, longitude))
+      await refreshWeather(await reverseGeocodePlace(latitude, longitude, openWeatherOptions.value))
     } catch {
       await refreshWeather({ name: '当前位置', country: '', latitude, longitude, timezone: 'auto' })
     }
@@ -464,6 +554,147 @@ function clearSearch() {
 
 function hideMinuteTooltip() {
   minuteTooltip.value = { ...minuteTooltip.value, visible: false }
+}
+
+function chartTheme() {
+  const isDark = darkMode.value
+  return {
+    text: isDark ? '#f4f1e8' : '#202326',
+    grid: isDark ? 'rgba(244,241,232,.14)' : 'rgba(32,35,38,.18)',
+  }
+}
+
+function validNumber(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+function chartUnit(label) {
+  if (label === '降水' || label.includes('RAIN')) return 'mm'
+  if (label === '风速' || label === '阵风' || label.includes('WIND') || label.includes('GUST')) return 'km/h'
+  if (label.includes('湿度') || label.includes('云量') || label.includes('概率') || label.includes('HUMID') || label.includes('CLOUD') || label.includes('POP')) return '%'
+  return '°C'
+}
+
+function chartLabel(label) {
+  return {
+    'TEMP C': '温度',
+    'FEELS C': '体感',
+    'RAIN mm': '降水',
+    'WIND km/h': '风速',
+    'GUST km/h': '阵风',
+  }[label] || label
+}
+
+function chartValue(label, value) {
+  if (!Number.isFinite(value)) return '--'
+  const unit = chartUnit(label)
+  const precision = unit === 'mm' || unit === '°C' ? 1 : 0
+  return `${rounded(value, precision)} ${unit}`
+}
+
+function resizeChartCanvas(canvas, minHeight = 240) {
+  const wrap = canvas?.parentElement
+  if (!canvas || !wrap) return
+  canvas.width = Math.max(320, Math.floor(wrap.clientWidth))
+  canvas.height = Math.max(minHeight, Math.floor(wrap.clientHeight))
+}
+
+function chartTooltip(chartId) {
+  return {
+    enabled: false,
+    mode: 'index',
+    axis: 'x',
+    intersect: false,
+    external: ({ chart, tooltip }) => {
+      if (!tooltip || tooltip.opacity === 0) {
+        hideMinuteTooltip()
+        return
+      }
+
+      const points = (tooltip.dataPoints || [])
+        .filter((point) => Number.isFinite(point.parsed?.y))
+        .sort((a, b) => a.datasetIndex - b.datasetIndex)
+      if (!points.length) {
+        hideMinuteTooltip()
+        return
+      }
+
+      const rect = chart.canvas.getBoundingClientRect()
+      const wrapRect = chart.canvas.parentElement.getBoundingClientRect()
+      minuteTooltip.value = {
+        visible: true,
+        chartId,
+        x: rect.left - wrapRect.left + tooltip.caretX,
+        y: rect.top - wrapRect.top + tooltip.caretY,
+        title: tooltip.title?.[0] || '',
+        items: points.map((point) => ({
+          label: chartLabel(point.dataset.label),
+          value: chartValue(point.dataset.label, point.parsed.y),
+          color: point.dataset.borderColor || point.dataset.backgroundColor || '#3c8527',
+        })),
+      }
+    },
+  }
+}
+
+function chartOptions(chartId, scales) {
+  const { text, grid } = chartTheme()
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 180 },
+    interaction: { mode: 'index', axis: 'x', intersect: false },
+    events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
+    plugins: {
+      legend: {
+        labels: {
+          color: text,
+          boxWidth: 16,
+          boxHeight: 12,
+          font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' },
+        },
+      },
+      tooltip: chartTooltip(chartId),
+    },
+    scales: {
+      x: {
+        type: 'category',
+        axis: 'x',
+        ticks: {
+          color: text,
+          maxRotation: 0,
+          autoSkip: true,
+          maxTicksLimit: 8,
+          font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' },
+        },
+        grid: { color: grid },
+      },
+      ...scales,
+    },
+  }
+}
+
+function tempAxis() {
+  const { text, grid } = chartTheme()
+  return {
+    type: 'linear',
+    axis: 'y',
+    ticks: { color: text, font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' } },
+    grid: { color: grid },
+  }
+}
+
+function secondaryAxis(position = 'right') {
+  const { text } = chartTheme()
+  return {
+    type: 'linear',
+    axis: 'y',
+    position,
+    beginAtZero: true,
+    ticks: { color: text, font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' } },
+    grid: { drawOnChartArea: false },
+  }
 }
 
 function zoomMap(delta) {
@@ -610,100 +841,89 @@ async function loadRoadNetwork() {
 }
 
 async function renderMinuteChart() {
-  if (activeTab.value !== 'minute' || !weather.value?.minutely?.length) return
+  if (activeTab.value !== 'minute' || !weather.value) return
   await nextTick()
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (!minuteCanvas.value) return
     minuteChart?.destroy()
-    const wrap = minuteCanvas.value.parentElement
-    if (wrap) {
-      minuteCanvas.value.width = Math.max(320, Math.floor(wrap.clientWidth))
-      minuteCanvas.value.height = Math.max(280, Math.floor(wrap.clientHeight))
+    hourlyChart?.destroy()
+    windChart?.destroy()
+    minuteChart = null
+    hourlyChart = null
+    windChart = null
+
+    const minutely = weather.value.minutely || []
+    const hourly = weather.value.hourly || []
+    if (minuteCanvas.value && minutely.length && (!isOpenWeatherSource.value || minuteHasPrecipitation.value)) {
+      resizeChartCanvas(minuteCanvas.value, 260)
+      const labels = minutely.map((item) => formatHour(item.time))
+      const datasets = []
+      if (!isOpenWeatherSource.value) {
+        datasets.push({
+          label: '温度',
+          data: minutely.map((item) => validNumber(item.temp)),
+          borderColor: '#3c8527',
+          backgroundColor: 'rgba(60,133,39,.14)',
+          borderWidth: 3,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHitRadius: 14,
+          tension: 0.36,
+          cubicInterpolationMode: 'monotone',
+          yAxisID: 'temp',
+        })
+      }
+      datasets.push({
+        type: 'bar',
+        label: '降水',
+        data: minutely.map((item) => validNumber(item.precipitation)),
+        borderColor: '#5fa9d8',
+        backgroundColor: 'rgba(95,169,216,.42)',
+        borderWidth: 2,
+        borderSkipped: false,
+        barPercentage: 1,
+        categoryPercentage: 0.98,
+        maxBarThickness: isOpenWeatherSource.value ? 24 : 56,
+        yAxisID: 'rain',
+      })
+      minuteChart = new Chart(minuteCanvas.value, {
+        type: 'line',
+        data: { labels, datasets },
+        options: chartOptions('minute', {
+          temp: { ...tempAxis(), display: !isOpenWeatherSource.value },
+          rain: secondaryAxis(isOpenWeatherSource.value ? 'left' : 'right'),
+        }),
+      })
     }
-    const isDark = darkMode.value
-    const text = isDark ? '#f4f1e8' : '#202326'
-    const grid = isDark ? 'rgba(244,241,232,.14)' : 'rgba(32,35,38,.18)'
-    const labels = weather.value.minutely.map((item) => formatHour(item.time))
-    const temps = weather.value.minutely.map((item) => item.temp)
-    const rain = weather.value.minutely.map((item) => item.precipitation)
-    minuteChart = new Chart(minuteCanvas.value, {
-      type: 'line',
-      data: {
-        labels,
-        datasets: [
-          { label: '温度 °C', data: temps, borderColor: '#3c8527', backgroundColor: 'rgba(60,133,39,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.42, cubicInterpolationMode: 'monotone', yAxisID: 'y' },
-          { label: '降水 mm', data: rain, borderColor: '#b8944d', backgroundColor: 'rgba(184,148,77,.16)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.42, cubicInterpolationMode: 'monotone', yAxisID: 'rain' },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: { duration: 180 },
-        plugins: {
-          legend: { labels: { color: text, boxWidth: 16, font: { family: 'Minecraft Seven' } } },
-          tooltip: {
-            enabled: false,
-            mode: 'nearest',
-            axis: 'xy',
-            intersect: false,
-            external: ({ chart, tooltip }) => {
-              if (!tooltip || tooltip.opacity === 0) {
-                hideMinuteTooltip()
-                return
-              }
-              const dataPoints = tooltip.dataPoints ?? []
-              const point = dataPoints[0]
-              const index = point?.dataIndex ?? 0
-              const item = weather.value?.minutely?.[index]
-              const rect = chart.canvas.getBoundingClientRect()
-              const wrapRect = chart.canvas.parentElement.getBoundingClientRect()
-              const activeElements = chart.getActiveElements()
-              const activePoint = activeElements[0]?.element
-              const nearbyPoints = activePoint
-                ? chart.data.datasets
-                  .map((dataset, datasetIndex) => {
-                    const meta = chart.getDatasetMeta(datasetIndex)
-                    const element = meta.data[index]
-                    if (!element) return null
-                    const distance = Math.abs(element.y - activePoint.y)
-                    return { dataset, datasetIndex, element, distance, value: dataset.data[index] }
-                  })
-                  .filter(Boolean)
-                  .filter((entry) => entry.distance <= 10)
-                : []
-              const entries = nearbyPoints.length > 1
-                ? nearbyPoints.sort((a, b) => a.datasetIndex - b.datasetIndex)
-                : [{
-                    dataset: point?.dataset,
-                    datasetIndex: point?.datasetIndex ?? 0,
-                    value: point?.parsed?.y,
-                  }]
-              minuteTooltip.value = {
-                visible: true,
-                x: rect.left - wrapRect.left + tooltip.caretX,
-                y: rect.top - wrapRect.top + tooltip.caretY,
-                title: item ? formatHour(item.time) : tooltip.title?.[0] || '',
-                items: entries.map((entry) => {
-                  const isTemperature = entry.datasetIndex === 0
-                  return {
-                    label: isTemperature ? '温度' : '降水',
-                    value: Number.isFinite(entry.value) ? `${rounded(entry.value, isTemperature ? 1 : 2)} ${isTemperature ? '°C' : 'mm'}` : '--',
-                    color: entry.dataset?.borderColor || (isTemperature ? '#3c8527' : '#b8944d'),
-                  }
-                }),
-              }
-            },
-          },
+
+    if (hourlyCanvas.value && hourly.length) {
+      resizeChartCanvas(hourlyCanvas.value, 240)
+      hourlyChart = new Chart(hourlyCanvas.value, {
+        type: 'line',
+        data: {
+          labels: hourly.map((item) => formatHour(item.time)),
+          datasets: [
+            { label: '温度', data: hourly.map((item) => validNumber(item.temp)), borderColor: '#3c8527', backgroundColor: 'rgba(60,133,39,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.32, cubicInterpolationMode: 'monotone', yAxisID: 'temp' },
+            { label: '体感', data: hourly.map((item) => validNumber(item.feelsLike)), borderColor: '#b8944d', backgroundColor: 'rgba(184,148,77,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.32, cubicInterpolationMode: 'monotone', yAxisID: 'temp' },
+          ],
         },
-        interaction: { mode: 'nearest', axis: 'xy', intersect: false },
-        events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
-        scales: {
-          x: { ticks: { color: text, maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }, grid: { color: grid } },
-          y: { ticks: { color: text }, grid: { color: grid } },
-          rain: { position: 'right', ticks: { color: text }, grid: { drawOnChartArea: false } },
+        options: chartOptions('hourly', { temp: tempAxis() }),
+      })
+    }
+
+    if (windCanvas.value && hourly.length) {
+      resizeChartCanvas(windCanvas.value, 240)
+      windChart = new Chart(windCanvas.value, {
+        type: 'line',
+        data: {
+          labels: hourly.map((item) => formatHour(item.time)),
+          datasets: [
+            { label: '风速', data: hourly.map((item) => validNumber(item.wind) === null ? null : item.wind * 3.6), borderColor: '#2e6f9e', backgroundColor: 'rgba(46,111,158,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.3, cubicInterpolationMode: 'monotone', yAxisID: 'wind' },
+            { label: '阵风', data: hourly.map((item) => validNumber(item.windGust) === null ? null : item.windGust * 3.6), borderColor: '#c56a32', backgroundColor: 'rgba(197,106,50,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.3, cubicInterpolationMode: 'monotone', yAxisID: 'wind' },
+          ],
         },
-      },
-    })
+        options: chartOptions('wind', { wind: tempAxis() }),
+      })
+    }
   }))
 }
 
@@ -727,7 +947,7 @@ function drawRoadBackdrop() {
   ctx.lineCap = 'square'
   const isWideCanvas = width > 1180
   const roadOffsetX = isWideCanvas ? 200 : 0
-  const roadOffsetY = isWideCanvas ? -100 : -150
+  const roadOffsetY = isWideCanvas ? -100 : 0
   
   const gradient = ctx.createLinearGradient(width, 0, 0, height)
   gradient.addColorStop(0, isDark ? 'rgba(36,96,42,0.42)' : 'rgba(18,48,34,0.46)')
@@ -790,6 +1010,77 @@ function formatHour(time) {
   return new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+function stepMinutes(rows = []) {
+  if (!rows || rows.length < 2) return null
+  const first = new Date(rows[0].time).getTime()
+  const second = new Date(rows[1].time).getTime()
+  if (!Number.isFinite(first) || !Number.isFinite(second)) return null
+  return Math.round((second - first) / 60000)
+}
+
+function formatStepLabel(minutes) {
+  if (!minutes) return 'unknown-step'
+  if (minutes < 60) return `${minutes} min-step`
+  const hours = minutes / 60
+  return `${Number.isInteger(hours) ? hours : rounded(hours, 1)} h-step`
+}
+
+function decodeDebugPart(value) {
+  const text = String(value ?? '')
+  try {
+    return decodeURIComponent(text.replace(/\+/g, ' '))
+  } catch {
+    return text
+  }
+}
+
+function formatDebugRequest(request) {
+  try {
+    const url = new URL(request.url)
+    return {
+      ...request,
+      origin: url.origin,
+      path: decodeDebugPart(url.pathname),
+      endpoint: `${url.origin}${decodeDebugPart(url.pathname)}`,
+      params: [...url.searchParams.entries()].map(([key, value]) => ({
+        key: decodeDebugPart(key),
+        value: decodeDebugPart(value),
+      })),
+    }
+  } catch {
+    const decodedUrl = decodeDebugPart(request.url)
+    return {
+      ...request,
+      origin: '',
+      path: decodedUrl,
+      endpoint: decodedUrl,
+      params: [],
+    }
+  }
+}
+
+function formatDebugTime(value) {
+  if (!value) return '--'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+function formatDebugSeries(series) {
+  return {
+    ...series,
+    stepLabel: formatStepLabel(series.stepMinutes),
+    firstLabel: formatDebugTime(series.first),
+    lastLabel: formatDebugTime(series.last),
+  }
+}
+
 function formatDay(time) {
   return new Date(time).toLocaleDateString('zh-CN', { weekday: 'short', month: 'numeric', day: 'numeric' })
 }
@@ -805,6 +1096,11 @@ function formatForecastWeek(time) {
 function formatTime(time) {
   if (!time) return '--'
   return new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+function formatAlertRange(alert) {
+  if (!alert.start && !alert.end) return '时间待确认'
+  return `${formatTime(alert.start)} - ${formatTime(alert.end)}`
 }
 
 function formatDurationHours(seconds) {
@@ -825,6 +1121,23 @@ function visibilityStatus(value) {
   if (km >= 10) return '能见度良好'
   if (km >= 4) return '能见度一般'
   return '能见度偏低'
+}
+
+function dewPointStatus(value) {
+  if (!Number.isFinite(value)) return '露点 --'
+  if (value >= 24) return '闷热潮湿'
+  if (value >= 18) return '湿度体感明显'
+  if (value <= 5) return '空气偏干'
+  return '湿度体感适中'
+}
+
+function particulateStatus(air = {}) {
+  const pm25 = Number(air.pm25)
+  const pm10 = Number(air.pm10)
+  if (!Number.isFinite(pm25) && !Number.isFinite(pm10)) return '颗粒物 --'
+  if (pm25 >= 35 || pm10 >= 100) return '颗粒物偏高'
+  if (pm25 >= 15 || pm10 >= 50) return '颗粒物一般'
+  return '颗粒物较低'
 }
 
 function radiationStatus(value) {
@@ -987,6 +1300,10 @@ function rounded(value, digits = 0) {
               <span>OWM Key</span>
               <input v-model="owmApiKey" type="password" placeholder="OpenWeatherMap API Key" />
             </label>
+            <label class="setting-row">
+              <span>优先使用 OWM 数据</span>
+              <McSwitch v-model="useOpenWeatherData" :disabled="!owmApiKey.trim()" />
+            </label>
           </div>
         </div>
       </Transition>
@@ -994,6 +1311,19 @@ function rounded(value, digits = 0) {
 
     <Transition name="fade">
       <p v-if="error" class="error-line">{{ error }}</p>
+    </Transition>
+
+    <Transition name="slide-fade">
+      <section v-if="current && displayedWeatherAlerts.length" class="weather-alerts">
+        <article v-for="alert in displayedWeatherAlerts" :key="alert.id" class="weather-alert">
+          <div>
+            <span class="material-symbols-outlined" aria-hidden="true">warning</span>
+            <strong>{{ alert.title }}</strong>
+          </div>
+          <p>{{ alert.description || '当前位置存在天气警报，请留意官方更新并调整出行安排。' }}</p>
+          <small>{{ alert.sender }} · {{ formatAlertRange(alert) }}</small>
+        </article>
+      </section>
     </Transition>
 
     <Transition name="slide-fade" mode="out-in">
@@ -1081,22 +1411,52 @@ function rounded(value, digits = 0) {
 
     <Transition name="slide-fade" mode="out-in">
       <section v-if="activeTab === 'current' && current" key="current" class="content-grid">
-        <McPanel v-for="item in [
-          ['UVI', rounded(current.uvi, 1), uvStatus(current.uvi)],
-          ['能见度', `${rounded(current.visibility / 1000, 1)} km`, visibilityStatus(current.visibility)],
-          ['日出 - 日落', `${formatTime(weather.daily[0]?.sunrise)} - ${formatTime(weather.daily[0]?.sunset)}`, `白昼 ${formatDurationHours(weather.daily[0]?.daylightDuration)}`],
-          ['短波辐射', `${rounded(current.radiation)} W/m²`, radiationStatus(current.radiation)],
-        ]" :key="item[0]" :title="item[0]" :subtitle="item[2]" bordered>
+        <McPanel v-for="item in detailMetrics" :key="item[0]" :title="item[0]" :subtitle="item[2]" bordered>
           <p class="metric-value">{{ item[1] }}</p>
         </McPanel>
       </section>
 
       <section v-else-if="activeTab === 'minute' && weather" key="minute" class="chart-panel">
-        <McPanel title="未来 15 分钟级趋势" subtitle="温度与降水" bordered>
-          <div class="chart-wrap" @mouseleave="hideMinuteTooltip">
+        <McPanel v-if="weather.minutely?.length" :title="minutePanelTitle" :subtitle="minutePanelSubtitle" bordered>
+          <div v-if="!isOpenWeatherSource || minuteHasPrecipitation" class="chart-wrap" @mouseleave="hideMinuteTooltip">
             <canvas ref="minuteCanvas"></canvas>
             <div
-              v-if="minuteTooltip.visible"
+              v-if="minuteTooltip.visible && minuteTooltip.chartId === 'minute'"
+              class="chart-tooltip-panel"
+              :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
+            >
+              <strong>{{ minuteTooltip.title }}</strong>
+              <span v-for="item in minuteTooltip.items" :key="item.label" class="chart-tooltip-row">
+                <i :style="{ backgroundColor: item.color }"></i>
+                <b>{{ item.label }}</b>
+                <em>{{ item.value }}</em>
+              </span>
+            </div>
+          </div>
+          <p v-else class="chart-empty">未来 60 分钟无明显降水。</p>
+        </McPanel>
+        <McPanel v-if="weather.hourly?.length" title="未来 48 小时温度表" :subtitle="`${hourlyStepLabel} · 气温与体感`" bordered>
+          <div class="chart-wrap chart-wrap--compact" @mouseleave="hideMinuteTooltip">
+            <canvas ref="hourlyCanvas"></canvas>
+            <div
+              v-if="minuteTooltip.visible && minuteTooltip.chartId === 'hourly'"
+              class="chart-tooltip-panel"
+              :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
+            >
+              <strong>{{ minuteTooltip.title }}</strong>
+              <span v-for="item in minuteTooltip.items" :key="item.label" class="chart-tooltip-row">
+                <i :style="{ backgroundColor: item.color }"></i>
+                <b>{{ item.label }}</b>
+                <em>{{ item.value }}</em>
+              </span>
+            </div>
+          </div>
+        </McPanel>
+        <McPanel v-if="weather.hourly?.length" title="未来 48 小时风力表" :subtitle="`${hourlyStepLabel} · 风速与阵风`" bordered>
+          <div class="chart-wrap chart-wrap--compact" @mouseleave="hideMinuteTooltip">
+            <canvas ref="windCanvas"></canvas>
+            <div
+              v-if="minuteTooltip.visible && minuteTooltip.chartId === 'wind'"
               class="chart-tooltip-panel"
               :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
             >
@@ -1136,7 +1496,7 @@ function rounded(value, digits = 0) {
             <div class="forecast-group">
               <b>降水</b>
               <span>{{ rounded(day.precipitation, 1) }} mm · {{ rounded(day.precipitationProbability) }}%</span>
-              <small>{{ rounded(day.precipitationHours, 1) }} h</small>
+              <small>{{ Number.isFinite(day.precipitationHours) ? `${rounded(day.precipitationHours, 1)} h` : '雨雪量 / 概率' }}</small>
             </div>
             <div class="forecast-group">
               <b>风</b>
@@ -1146,7 +1506,7 @@ function rounded(value, digits = 0) {
             <div class="forecast-group">
               <b>天光</b>
               <span>UV {{ rounded(day.uvMax, 1) }}</span>
-              <small>日照 {{ formatDurationHours(day.sunshineDuration) }}</small>
+              <small>{{ isOpenWeatherSource ? `云量 ${rounded(day.cloudCover)}%` : `日照 ${formatDurationHours(day.sunshineDuration)}` }}</small>
             </div>
           </div>
 
@@ -1183,6 +1543,64 @@ function rounded(value, digits = 0) {
         </McPanel>
       </section>
     </Transition>
+
+    <McModal v-model:open="debugModalOpen" title="调试数据" :close-on-overlay="true">
+      <div class="debug-modal">
+        <div class="debug-scroll-frame">
+          <mc-scroll-view class="debug-scroll">
+            <div class="debug-content">
+              <section class="debug-section debug-section--summary">
+                <div class="debug-summary">
+                  <span>快捷键</span>
+                  <strong>Ctrl + Alt + D</strong>
+                </div>
+                <div class="debug-summary">
+                  <span>数据源</span>
+                  <strong>{{ weatherDebug?.provider || (isOpenWeatherSource ? 'OpenWeatherMap' : 'Open-Meteo') }}</strong>
+                </div>
+                <div class="debug-summary">
+                  <span>地点</span>
+                  <strong>{{ placeTitle }}</strong>
+                </div>
+              </section>
+
+              <section class="debug-section">
+                <h3>请求</h3>
+                <p v-if="!debugRequests.length" class="debug-empty">暂无请求记录。</p>
+                <div v-else class="debug-table">
+                  <div v-for="request in debugRequests" :key="request.label + request.url" class="debug-request">
+                    <strong>{{ request.label }}</strong>
+                    <code>{{ request.endpoint }}</code>
+                    <div class="debug-param-grid">
+                      <span v-for="param in request.params" :key="request.label + param.key">
+                        <b>{{ param.key }}</b>
+                        <em>{{ param.value }}</em>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="debug-section">
+                <h3>序列</h3>
+                <p v-if="!debugSeriesRows.length" class="debug-empty">暂无序列记录。</p>
+                <div v-else class="debug-table">
+                  <div v-for="series in debugSeriesRows" :key="series.label" class="debug-series">
+                    <strong>{{ series.label }}</strong>
+                    <div class="debug-series-grid">
+                      <span><b>数量</b><em>{{ series.count }}</em></span>
+                      <span><b>步长</b><em>{{ series.stepLabel }}</em></span>
+                      <span><b>开始</b><em>{{ series.firstLabel }}</em></span>
+                      <span><b>结束</b><em>{{ series.lastLabel }}</em></span>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </mc-scroll-view>
+        </div>
+      </div>
+    </McModal>
 
     <McModal v-model:open="skinModalOpen" title="角色皮肤" :close-on-overlay="true" :show-close="false">
       <div class="skin-modal">
