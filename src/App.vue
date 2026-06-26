@@ -1,0 +1,1264 @@
+<script setup>
+import { Chart, registerables } from 'chart.js'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { McButton, McButtonTabs, McDropdown, McModal, McPanel, McProgress, McRadioGroup, McSkinViewer, McSwitch, McTooltip, playSound } from 'mcui-oreui'
+import { DEFAULT_PLACE, loadWeather, reverseGeocodePlace, searchPlaces } from './services/weather.js'
+
+Chart.register(...registerables)
+
+const DEFAULT_PLACE_KEY = 'mc-weather-default-place'
+const DEFAULT_SKIN = '/skin-default.png'
+const refreshOptions = ['5 分钟', '15 分钟', '30 分钟', '60 分钟']
+const refreshOptionValues = [5, 15, 30, 60]
+const skinPoseOptions = ['站立', '行走']
+const skinPoseValues = ['none', 'walk']
+const themeOptions = [
+  { label: '浅色', value: 'light' },
+  { label: '深色', value: 'dark' },
+  { label: '自动', value: 'auto' },
+]
+const loadingSpinnerSrc = '/mcui-oreui/assets/Loading_white.DMpwGoUC.gif'
+const owmLayerOptions = [
+  { label: '降水', value: 'precipitation_new' },
+  { label: '云量', value: 'clouds_new' },
+  { label: '温度', value: 'temp_new' },
+  { label: '风场', value: 'wind_new' },
+  { label: '气压', value: 'pressure_new' },
+]
+
+const tabs = [
+  { label: '概览', value: 'current' },
+  { label: '分钟', value: 'minute' },
+  { label: '预报', value: 'forecast' },
+  { label: '天气建议', value: 'advice' },
+]
+
+const activeTab = ref('current')
+const controlPage = ref('location')
+const themeMode = ref(localStorage.getItem('mc-weather-theme') || 'auto')
+const prefersDark = ref(typeof window !== 'undefined' ? window.matchMedia('(prefers-color-scheme: dark)').matches : true)
+const darkMode = computed(() => themeMode.value === 'auto' ? prefersDark.value : themeMode.value === 'dark')
+const autoRefresh = ref(localStorage.getItem('mc-weather-auto-refresh') === 'true')
+const refreshMinutes = ref(Number(localStorage.getItem('mc-weather-refresh-minutes') || 15))
+const owmApiKey = ref(localStorage.getItem('mc-weather-owm-key') || import.meta.env.VITE_OWM_API_KEY || '')
+const owmLayer = ref(localStorage.getItem('mc-weather-owm-layer') || 'precipitation_new')
+const skinModalOpen = ref(false)
+const skinUrl = ref(localStorage.getItem('mc-weather-skin-url') || DEFAULT_SKIN)
+const skinFileInput = ref(null)
+const skinSlim = ref(localStorage.getItem('mc-weather-skin-slim') === 'true')
+const skinSecondLayer = ref(localStorage.getItem('mc-weather-skin-second-layer') !== 'false')
+const skinAutoRotate = ref(localStorage.getItem('mc-weather-skin-auto-rotate') === 'true')
+const skinPose = ref(localStorage.getItem('mc-weather-skin-pose') || 'walk')
+const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1180)
+const query = ref('')
+const places = ref([])
+const searchMiss = ref(false)
+const selectedPlace = ref(DEFAULT_PLACE)
+const savedDefaultPlace = ref(loadSavedDefaultPlace())
+const weather = ref(null)
+const loading = ref(false)
+const locating = ref(false)
+const error = ref('')
+const minuteCanvas = ref(null)
+const minuteTooltip = ref({ visible: false, x: 0, y: 0, title: '', items: [] })
+const roadCanvas = ref(null)
+const mapElement = ref(null)
+const roadWays = ref([])
+
+let searchTimer = 0
+let refreshTimer = 0
+let minuteChart = null
+let resizeObserver = null
+let leafletMap = null
+let baseLayer = null
+let weatherLayer = null
+let locationMarker = null
+let mapHost = null
+let themeMediaQuery = null
+let themeChangeHandler = null
+
+const current = computed(() => weather.value?.current)
+const cei = computed(() => current.value?.cei)
+const ceiLevelTitle = computed(() => {
+  const [title] = String(cei.value?.level || '').split(' - ')
+  return title.replace(/^CEI\s+/, '') || '--'
+})
+const ceiLevelDescription = computed(() => {
+  const [, description] = String(cei.value?.level || '').split(' - ')
+  return description || ''
+})
+const nowDisplay = computed(() => weather.value ? new Date(weather.value.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '--')
+const placeTitle = computed(() => formatPlace(selectedPlace.value))
+const placeMeta = computed(() => `${Number(selectedPlace.value.latitude).toFixed(4)}, ${Number(selectedPlace.value.longitude).toFixed(4)}`)
+const defaultPlaceTitle = computed(() => savedDefaultPlace.value ? formatPlace(savedDefaultPlace.value) : '未设置')
+const currentOwmLayerLabel = computed(() => owmLayerOptions.find((item) => item.value === owmLayer.value)?.label || '图层')
+const activeSkin = computed(() => skinUrl.value.trim() || DEFAULT_SKIN)
+const skinPoseIndex = computed({
+  get: () => Math.max(1, skinPoseValues.indexOf(skinPose.value) + 1),
+  set: (index) => {
+    skinPose.value = skinPoseValues[index - 1] ?? 'walk'
+  },
+})
+const skinScale = computed(() => {
+  if (viewportWidth.value >= 1080) return 1.95
+  if (viewportWidth.value >= 720) return 1.7
+  return 1.45
+})
+const previewSkinScale = 4.4
+const refreshOptionIndex = computed({
+  get: () => Math.max(1, refreshOptionValues.indexOf(Number(refreshMinutes.value)) + 1),
+  set: (index) => {
+    refreshMinutes.value = refreshOptionValues[index - 1] ?? 15
+  },
+})
+const mainEffect = computed(() => ({
+  heat: '体感温度',
+  air: '空气质量',
+  uv: '紫外线',
+  pressure: '气压',
+  risk: '安全风险',
+}[cei.value?.detail.main_effect] ?? '综合环境'))
+const weatherIcon = computed(() => {
+  const code = current.value?.weatherCode
+  if ([0, 1].includes(code)) return current.value?.isDay === 0 ? 'clear_night' : 'clear_day'
+  if ([2, 3].includes(code)) return 'cloud'
+  if ([45, 48].includes(code)) return 'foggy'
+  if (code >= 51 && code <= 67) return 'rainy'
+  if (code >= 71 && code <= 86) return 'weather_snowy'
+  if (code >= 95) return 'thunderstorm'
+  return 'partly_cloudy_day'
+})
+const riskFactors = computed(() => {
+  const labels = {
+    extreme_cold: '严寒',
+    extreme_heat: '高温',
+    wind: '强风',
+    snow_ice: '雪冰',
+    heavy_rain: '强降雨',
+    thunderstorm: '雷暴',
+    fog: '低能见度',
+    dust_sand: '沙尘',
+    tornado: '龙卷风',
+    air_quality: '空气健康',
+  }
+  return (cei.value?.detail.risk.factors ?? []).map((item) => labels[item] ?? item)
+})
+const aqiSummary = computed(() => {
+  const aqi = current.value?.air?.europeanAqi || current.value?.air?.usAqi || 0
+  if (aqi <= 20) return { value: aqi, label: '优' }
+  if (aqi <= 40) return { value: aqi, label: '良' }
+  if (aqi <= 60) return { value: aqi, label: '一般' }
+  if (aqi <= 80) return { value: aqi, label: '较差' }
+  return { value: aqi, label: '差' }
+})
+const summaryText = computed(() => {
+  if (!current.value || !cei.value) return ''
+  const rain = current.value.precipitationProbability >= 50 ? '降水概率偏高，建议带伞。' : '短时降水概率不高。'
+  const wind = current.value.windGust * 3.6 >= 25 ? '阵风较明显，注意固定随身物品。' : '风力整体温和。'
+  const air = aqiSummary.value.value >= 60 ? '空气质量一般，敏感人群减少长时间户外活动。' : '空气质量处于可接受范围。'
+  return `${placeTitle.value} 当前 ${current.value.label}，气温 ${rounded(current.value.temp)}°C，体感 ${rounded(current.value.feelsLike)}°C。CEI 为 ${cei.value.cei}，主要影响来自 ${mainEffect.value}。${rain}${wind}${air}`
+})
+const currentBrief = computed(() => {
+  if (!current.value) return ''
+  const rain = current.value.precipitationProbability >= 40 ? '短时有降水可能' : '短时降水不明显'
+  const wind = current.value.windGust * 3.6 >= 25 ? '阵风偏明显' : '风力平稳'
+  return `${current.value.label}，体感 ${rounded(current.value.feelsLike)}°C，${rain}，${wind}。`
+})
+const ceiAdvice = computed(() => {
+  const score = cei.value?.cei ?? 0
+  if (score >= 80) return '环境舒适，适合正常户外活动。'
+  if (score >= 60) return '整体可接受，留意主要影响项即可。'
+  if (score >= 40) return '舒适度偏低，建议减少长时间暴露。'
+  return '环境压力较高，尽量降低户外停留时间。'
+})
+const ceiTone = computed(() => {
+  const score = cei.value?.cei ?? 0
+  if (score >= 80) return '#3c8527'
+  if (score >= 60) return '#b8944d'
+  if (score >= 40) return '#c56a32'
+  return '#c94b3e'
+})
+const overviewMetrics = computed(() => [
+  ['体感', `${rounded(current.value?.feelsLike)}°C`],
+  ['云量', `${rounded(current.value?.cloudCover)}%`],
+  ['降水', `${rounded(current.value?.precipitationProbability)}%`],
+  ['湿度', `${rounded(current.value?.humidity)}%`],
+  ['风速', `${rounded((current.value?.wind ?? 0) * 3.6)} km/h`],
+  ['阵风', `${rounded((current.value?.windGust ?? 0) * 3.6)} km/h`],
+  ['气压', `${rounded(current.value?.pressure)} hPa`],
+  ['AQI', `${rounded(aqiSummary.value.value)} ${aqiSummary.value.label}`],
+])
+watch(darkMode, (value) => {
+  document.documentElement.dataset.theme = value ? 'dark' : 'light'
+  drawRoadBackdrop()
+  renderMinuteChart()
+  updateLeafletMap()
+}, { immediate: true })
+
+watch(themeMode, (value) => {
+  localStorage.setItem('mc-weather-theme', value)
+})
+
+watch(autoRefresh, (value) => {
+  localStorage.setItem('mc-weather-auto-refresh', String(value))
+  setupAutoRefresh()
+})
+
+watch(refreshMinutes, (value) => {
+  localStorage.setItem('mc-weather-refresh-minutes', String(value))
+  setupAutoRefresh()
+})
+
+watch(owmApiKey, (value) => {
+  localStorage.setItem('mc-weather-owm-key', value.trim())
+  updateLeafletMap()
+})
+
+watch(owmLayer, (value) => {
+  localStorage.setItem('mc-weather-owm-layer', value)
+  updateLeafletMap()
+})
+
+watch(skinUrl, (value) => {
+  const normalized = value.trim() || DEFAULT_SKIN
+  localStorage.setItem('mc-weather-skin-url', normalized)
+})
+
+watch(skinSlim, (value) => {
+  localStorage.setItem('mc-weather-skin-slim', String(value))
+})
+
+watch(skinSecondLayer, (value) => {
+  localStorage.setItem('mc-weather-skin-second-layer', String(value))
+})
+
+watch(skinAutoRotate, (value) => {
+  localStorage.setItem('mc-weather-skin-auto-rotate', String(value))
+})
+
+watch(skinPose, (value) => {
+  localStorage.setItem('mc-weather-skin-pose', value)
+})
+
+watch(query, (value) => {
+  clearTimeout(searchTimer)
+  searchMiss.value = false
+  if (value.trim().length < 2) {
+    places.value = []
+    return
+  }
+  searchTimer = setTimeout(async () => {
+    try {
+      places.value = await searchPlaces(value.trim())
+    } catch (err) {
+      error.value = err.message
+    }
+  }, 320)
+})
+
+watch([activeTab, weather, darkMode], () => scheduleMinuteChart())
+watch(current, () => scheduleLeafletMap())
+watch(selectedPlace, () => {
+  nextTick(() => {
+    updateLeafletMap()
+    loadRoadNetwork()
+  })
+}, { deep: true })
+
+onMounted(() => {
+  themeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+  themeChangeHandler = (event) => {
+    prefersDark.value = event.matches
+  }
+  themeMediaQuery.addEventListener?.('change', themeChangeHandler)
+  themeMediaQuery.addListener?.(themeChangeHandler)
+  loadInitialWeather()
+  setupAutoRefresh()
+  resizeObserver = new ResizeObserver(() => {
+    viewportWidth.value = window.innerWidth
+    drawRoadBackdrop()
+  })
+  resizeObserver.observe(document.body)
+  nextTick(() => {
+    drawRoadBackdrop()
+    initLeafletMap()
+  })
+})
+
+onBeforeUnmount(() => {
+  clearInterval(refreshTimer)
+  minuteChart?.destroy()
+  resizeObserver?.disconnect()
+  leafletMap?.remove()
+  if (themeMediaQuery && themeChangeHandler) {
+    themeMediaQuery.removeEventListener?.('change', themeChangeHandler)
+    themeMediaQuery.removeListener?.(themeChangeHandler)
+  }
+})
+
+async function refreshWeather(place = selectedPlace.value) {
+  loading.value = true
+  error.value = ''
+  try {
+    selectedPlace.value = place
+    weather.value = await loadWeather(place)
+    scheduleLeafletMap()
+    loadRoadNetwork()
+  } catch (err) {
+    error.value = err.message || '天气数据加载失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadInitialWeather() {
+  if (savedDefaultPlace.value) {
+    await refreshWeather(savedDefaultPlace.value)
+    return
+  }
+  await refreshWeatherFromCurrentLocation({ fallback: true, silentFallback: true })
+}
+
+function choosePlace(place) {
+  query.value = ''
+  places.value = []
+  searchMiss.value = false
+  refreshWeather(place)
+}
+
+async function chooseFirstPlace() {
+  const term = query.value.trim()
+  if (places.value.length) {
+    choosePlace(places.value[0])
+    return
+  }
+  if (term.length >= 2) {
+    try {
+      places.value = await searchPlaces(term)
+      if (places.value.length) choosePlace(places.value[0])
+      else searchMiss.value = true
+    } catch (err) {
+      error.value = err.message || '地点搜索失败'
+    }
+  }
+}
+
+async function useMyLocation() {
+  if (!navigator.geolocation) {
+    error.value = '当前浏览器不支持定位'
+    return
+  }
+  await refreshWeatherFromCurrentLocation({ fallback: false })
+}
+
+async function refreshWeatherFromCurrentLocation({ fallback = false, silentFallback = false } = {}) {
+  if (!navigator.geolocation) {
+    if (fallback) await refreshWeather(DEFAULT_PLACE)
+    return
+  }
+  locating.value = true
+  error.value = ''
+  try {
+    const position = await getCurrentPosition()
+    const latitude = Number(position.coords.latitude.toFixed(4))
+    const longitude = Number(position.coords.longitude.toFixed(4))
+    try {
+      await refreshWeather(await reverseGeocodePlace(latitude, longitude))
+    } catch {
+      await refreshWeather({ name: '当前位置', country: '', latitude, longitude, timezone: 'auto' })
+    }
+  } catch (err) {
+    if (fallback) {
+      if (!silentFallback) error.value = err.message || '定位失败，已使用默认地点'
+      await refreshWeather(DEFAULT_PLACE)
+    } else {
+      error.value = err.message || '定位失败'
+    }
+  } finally {
+    locating.value = false
+  }
+}
+
+function getCurrentPosition() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      resolve,
+      reject,
+      { enableHighAccuracy: true, timeout: 9000, maximumAge: 300000 },
+    )
+  })
+}
+
+function saveDefaultPlace() {
+  const place = {
+    name: selectedPlace.value.name,
+    admin1: selectedPlace.value.admin1 || '',
+    admin2: selectedPlace.value.admin2 || '',
+    country: selectedPlace.value.country || '',
+    latitude: Number(selectedPlace.value.latitude),
+    longitude: Number(selectedPlace.value.longitude),
+    timezone: selectedPlace.value.timezone || 'auto',
+  }
+  savedDefaultPlace.value = place
+  localStorage.setItem(DEFAULT_PLACE_KEY, JSON.stringify(place))
+}
+
+function clearDefaultPlace() {
+  savedDefaultPlace.value = null
+  localStorage.removeItem(DEFAULT_PLACE_KEY)
+}
+
+function openSkinModal() {
+  skinModalOpen.value = true
+}
+
+function resetSkin() {
+  skinUrl.value = DEFAULT_SKIN
+  skinSlim.value = false
+  skinSecondLayer.value = true
+  skinAutoRotate.value = false
+  skinPose.value = 'walk'
+}
+
+function chooseSkinFile() {
+  skinFileInput.value?.click()
+}
+
+function handleSkinFileChange(event) {
+  const [file] = event.target.files || []
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    skinUrl.value = String(reader.result || DEFAULT_SKIN)
+  }
+  reader.onerror = () => {
+    error.value = '皮肤文件读取失败'
+  }
+  reader.readAsDataURL(file)
+  event.target.value = ''
+}
+
+function handleSkinError() {
+  error.value = '皮肤图片加载失败，已恢复默认皮肤'
+  skinUrl.value = DEFAULT_SKIN
+}
+
+function playUiSound(type = 'click') {
+  try {
+    playSound(type)
+  } catch {
+    // Audio can be blocked before the first user gesture.
+  }
+}
+
+function clearSearch() {
+  playUiSound()
+  query.value = ''
+  places.value = []
+  searchMiss.value = false
+}
+
+function hideMinuteTooltip() {
+  minuteTooltip.value = { ...minuteTooltip.value, visible: false }
+}
+
+function zoomMap(delta) {
+  playUiSound()
+  if (!leafletMap) return
+  if (delta > 0) leafletMap.zoomIn()
+  else leafletMap.zoomOut()
+}
+
+function cycleOwmLayer() {
+  playUiSound()
+  const currentIndex = owmLayerOptions.findIndex((item) => item.value === owmLayer.value)
+  owmLayer.value = owmLayerOptions[(currentIndex + 1) % owmLayerOptions.length].value
+}
+
+function loadSavedDefaultPlace() {
+  const raw = localStorage.getItem(DEFAULT_PLACE_KEY)
+  if (!raw) return null
+  try {
+    const place = JSON.parse(raw)
+    if (!Number.isFinite(Number(place.latitude)) || !Number.isFinite(Number(place.longitude))) return null
+    return { ...place, latitude: Number(place.latitude), longitude: Number(place.longitude), timezone: place.timezone || 'auto' }
+  } catch {
+    localStorage.removeItem(DEFAULT_PLACE_KEY)
+    return null
+  }
+}
+
+function setupAutoRefresh() {
+  clearInterval(refreshTimer)
+  if (!autoRefresh.value) return
+  const minutes = Math.max(5, Math.min(60, Number(refreshMinutes.value) || 15))
+  refreshTimer = setInterval(() => refreshWeather(), minutes * 60 * 1000)
+}
+
+function scheduleMinuteChart() {
+  window.setTimeout(() => renderMinuteChart(), 320)
+}
+
+function scheduleLeafletMap() {
+  window.setTimeout(async () => {
+    await nextTick()
+    initLeafletMap()
+    updateLeafletMap()
+  }, 520)
+}
+
+function initLeafletMap() {
+  if (!mapElement.value) return
+  if (leafletMap && mapHost === mapElement.value) return
+  if (leafletMap) {
+    leafletMap.remove()
+    leafletMap = null
+    baseLayer = null
+    weatherLayer = null
+    locationMarker = null
+  }
+  mapHost = mapElement.value
+  const lat = Number(selectedPlace.value.latitude || DEFAULT_PLACE.latitude)
+  const lon = Number(selectedPlace.value.longitude || DEFAULT_PLACE.longitude)
+  leafletMap = L.map(mapElement.value, {
+    zoomControl: false,
+    attributionControl: false,
+  }).setView([lat, lon], 7)
+  L.control.attribution({ prefix: false }).addTo(leafletMap)
+  updateLeafletMap()
+}
+
+function updateLeafletMap() {
+  if (!leafletMap) return
+  const lat = Number(selectedPlace.value.latitude || DEFAULT_PLACE.latitude)
+  const lon = Number(selectedPlace.value.longitude || DEFAULT_PLACE.longitude)
+  leafletMap.setView([lat, lon], leafletMap.getZoom() || 7)
+
+  if (baseLayer) leafletMap.removeLayer(baseLayer)
+  const baseUrl = darkMode.value
+    ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+  baseLayer = L.tileLayer(baseUrl, {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap &copy; CARTO',
+  }).addTo(leafletMap)
+
+  if (weatherLayer) {
+    leafletMap.removeLayer(weatherLayer)
+    weatherLayer = null
+  }
+  if (owmApiKey.value.trim()) {
+    weatherLayer = L.tileLayer(`https://tile.openweathermap.org/map/${owmLayer.value}/{z}/{x}/{y}.png?appid=${owmApiKey.value.trim()}`, {
+      opacity: 0.72,
+      maxZoom: 19,
+      attribution: '&copy; OpenWeatherMap',
+    }).addTo(leafletMap)
+  }
+
+  if (locationMarker) leafletMap.removeLayer(locationMarker)
+  locationMarker = L.marker([lat, lon], {
+    icon: L.divIcon({
+      className: 'square-map-marker',
+      iconSize: [18, 18],
+      iconAnchor: [9, 9],
+    }),
+  }).addTo(leafletMap)
+  window.setTimeout(() => leafletMap.invalidateSize(), 80)
+}
+
+async function loadRoadNetwork() {
+  const lat = Number(selectedPlace.value.latitude)
+  const lon = Number(selectedPlace.value.longitude)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
+
+  const cacheKey = `roads:${lat.toFixed(2)}:${lon.toFixed(2)}`
+  const cached = localStorage.getItem(cacheKey)
+  if (cached) {
+    try {
+      roadWays.value = JSON.parse(cached)
+      drawRoadBackdrop()
+      return
+    } catch {
+      localStorage.removeItem(cacheKey)
+    }
+  }
+
+  const delta = 0.045
+  const bbox = `${lat - delta},${lon - delta},${lat + delta},${lon + delta}`
+  const queryText = `[out:json][timeout:12];way["highway"](${bbox});out geom;`
+  try {
+    const res = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      body: queryText,
+    })
+    if (!res.ok) throw new Error('Overpass request failed')
+    const data = await res.json()
+    roadWays.value = (data.elements || [])
+      .filter((item) => Array.isArray(item.geometry) && item.geometry.length > 1)
+      .slice(0, 420)
+      .map((item) => item.geometry.map((point) => [point.lat, point.lon]))
+    localStorage.setItem(cacheKey, JSON.stringify(roadWays.value))
+    drawRoadBackdrop()
+  } catch {
+    roadWays.value = []
+    drawRoadBackdrop()
+  }
+}
+
+async function renderMinuteChart() {
+  if (activeTab.value !== 'minute' || !weather.value?.minutely?.length) return
+  await nextTick()
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (!minuteCanvas.value) return
+    minuteChart?.destroy()
+    const wrap = minuteCanvas.value.parentElement
+    if (wrap) {
+      minuteCanvas.value.width = Math.max(320, Math.floor(wrap.clientWidth))
+      minuteCanvas.value.height = Math.max(280, Math.floor(wrap.clientHeight))
+    }
+    const isDark = darkMode.value
+    const text = isDark ? '#f4f1e8' : '#202326'
+    const grid = isDark ? 'rgba(244,241,232,.14)' : 'rgba(32,35,38,.18)'
+    const labels = weather.value.minutely.map((item) => formatHour(item.time))
+    const temps = weather.value.minutely.map((item) => item.temp)
+    const rain = weather.value.minutely.map((item) => item.precipitation)
+    minuteChart = new Chart(minuteCanvas.value, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: '温度 °C', data: temps, borderColor: '#3c8527', backgroundColor: 'rgba(60,133,39,.14)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.42, cubicInterpolationMode: 'monotone', yAxisID: 'y' },
+          { label: '降水 mm', data: rain, borderColor: '#b8944d', backgroundColor: 'rgba(184,148,77,.16)', borderWidth: 3, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, tension: 0.42, cubicInterpolationMode: 'monotone', yAxisID: 'rain' },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 180 },
+        plugins: {
+          legend: { labels: { color: text, boxWidth: 16, font: { family: 'Minecraft Seven' } } },
+          tooltip: {
+            enabled: false,
+            mode: 'nearest',
+            axis: 'xy',
+            intersect: false,
+            external: ({ chart, tooltip }) => {
+              if (!tooltip || tooltip.opacity === 0) {
+                hideMinuteTooltip()
+                return
+              }
+              const dataPoints = tooltip.dataPoints ?? []
+              const point = dataPoints[0]
+              const index = point?.dataIndex ?? 0
+              const item = weather.value?.minutely?.[index]
+              const rect = chart.canvas.getBoundingClientRect()
+              const wrapRect = chart.canvas.parentElement.getBoundingClientRect()
+              const activeElements = chart.getActiveElements()
+              const activePoint = activeElements[0]?.element
+              const nearbyPoints = activePoint
+                ? chart.data.datasets
+                  .map((dataset, datasetIndex) => {
+                    const meta = chart.getDatasetMeta(datasetIndex)
+                    const element = meta.data[index]
+                    if (!element) return null
+                    const distance = Math.abs(element.y - activePoint.y)
+                    return { dataset, datasetIndex, element, distance, value: dataset.data[index] }
+                  })
+                  .filter(Boolean)
+                  .filter((entry) => entry.distance <= 10)
+                : []
+              const entries = nearbyPoints.length > 1
+                ? nearbyPoints.sort((a, b) => a.datasetIndex - b.datasetIndex)
+                : [{
+                    dataset: point?.dataset,
+                    datasetIndex: point?.datasetIndex ?? 0,
+                    value: point?.parsed?.y,
+                  }]
+              minuteTooltip.value = {
+                visible: true,
+                x: rect.left - wrapRect.left + tooltip.caretX,
+                y: rect.top - wrapRect.top + tooltip.caretY,
+                title: item ? formatHour(item.time) : tooltip.title?.[0] || '',
+                items: entries.map((entry) => {
+                  const isTemperature = entry.datasetIndex === 0
+                  return {
+                    label: isTemperature ? '温度' : '降水',
+                    value: Number.isFinite(entry.value) ? `${rounded(entry.value, isTemperature ? 1 : 2)} ${isTemperature ? '°C' : 'mm'}` : '--',
+                    color: entry.dataset?.borderColor || (isTemperature ? '#3c8527' : '#b8944d'),
+                  }
+                }),
+              }
+            },
+          },
+        },
+        interaction: { mode: 'nearest', axis: 'xy', intersect: false },
+        events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
+        scales: {
+          x: { ticks: { color: text, maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }, grid: { color: grid } },
+          y: { ticks: { color: text }, grid: { color: grid } },
+          rain: { position: 'right', ticks: { color: text }, grid: { drawOnChartArea: false } },
+        },
+      },
+    })
+  }))
+}
+
+function drawRoadBackdrop() {
+  const canvas = roadCanvas.value
+  if (!canvas) return
+  const dpr = window.devicePixelRatio || 1
+  const width = window.innerWidth
+  const height = window.innerHeight
+  canvas.width = width * dpr
+  canvas.height = height * dpr
+  canvas.style.width = `${width}px`
+  canvas.style.height = `${height}px`
+
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, width, height)
+
+  const isDark = darkMode.value
+  ctx.globalAlpha = isDark ? 0.56 : 0.62
+  ctx.lineCap = 'square'
+  const isWideCanvas = width > 1180
+  const roadOffsetX = isWideCanvas ? 200 : 0
+  const roadOffsetY = isWideCanvas ? -100 : 0
+  
+  const gradient = ctx.createLinearGradient(width, 0, 0, height)
+  gradient.addColorStop(0, isDark ? 'rgba(36,96,42,0.42)' : 'rgba(18,48,34,0.46)')
+  gradient.addColorStop(0.52, isDark ? 'rgba(118,91,34,0.28)' : 'rgba(86,68,25,0.32)')
+  gradient.addColorStop(1, isDark ? 'rgba(0,0,0,0.06)' : 'rgba(20,26,20,0.16)')
+  ctx.strokeStyle = gradient
+
+  if (roadWays.value.length) {
+    const lat = Number(selectedPlace.value.latitude)
+    const lon = Number(selectedPlace.value.longitude)
+    const scale = Math.min(width, height) * 9
+    ctx.lineWidth = 1.2
+    roadWays.value.forEach((way, index) => {
+      ctx.lineWidth = index % 9 === 0 ? 2.4 : 1
+      ctx.beginPath()
+      way.forEach(([pointLat, pointLon], pointIndex) => {
+        const x = width * 0.62 + roadOffsetX + (pointLon - lon) * scale
+        const y = height * 0.42 + roadOffsetY - (pointLat - lat) * scale
+        if (pointIndex === 0) ctx.moveTo(x, y)
+        else ctx.lineTo(x, y)
+      })
+      ctx.stroke()
+    })
+    return
+  }
+
+  const seed = Math.abs(Math.sin(Number(selectedPlace.value.latitude) * 13.37 + Number(selectedPlace.value.longitude) * 7.91))
+  for (let i = 0; i < 42; i += 1) {
+    const lane = ((i * 73 + seed * 400) % (width + height)) - height * 0.35
+    ctx.lineWidth = i % 7 === 0 ? 2.8 : 1
+    ctx.beginPath()
+    ctx.moveTo(lane + roadOffsetX, height + roadOffsetY)
+    const midX = lane + roadOffsetX + height * 0.55 + Math.sin(i + seed) * 90
+    const midY = height * 0.48 + roadOffsetY + Math.cos(i * 1.7) * 120
+    ctx.lineTo(midX, midY)
+    ctx.lineTo(lane + roadOffsetX + height * 1.1, roadOffsetY)
+    ctx.stroke()
+  }
+
+  for (let i = 0; i < 22; i += 1) {
+    const y = ((i * 97 + seed * 300) % height) + roadOffsetY
+    ctx.lineWidth = i % 5 === 0 ? 2 : 1
+    ctx.beginPath()
+    ctx.moveTo(width * 0.05 + roadOffsetX, y)
+    ctx.lineTo(width * 0.55 + roadOffsetX + Math.sin(i) * 160, y - width * 0.28)
+    ctx.lineTo(width * 1.1 + roadOffsetX, y - width * 0.1)
+    ctx.stroke()
+  }
+}
+
+function formatPlace(place) {
+  return [place.name, place.admin2, place.admin1, place.country].filter(Boolean).filter(unique).join(' · ')
+}
+
+function unique(value, index, list) {
+  return list.indexOf(value) === index
+}
+
+function formatHour(time) {
+  return new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+function formatDay(time) {
+  return new Date(time).toLocaleDateString('zh-CN', { weekday: 'short', month: 'numeric', day: 'numeric' })
+}
+
+function formatForecastDate(time) {
+  return new Date(time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}
+
+function formatForecastWeek(time) {
+  return new Date(time).toLocaleDateString('zh-CN', { weekday: 'short' })
+}
+
+function formatTime(time) {
+  if (!time) return '--'
+  return new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+function formatDurationHours(seconds) {
+  return Number.isFinite(seconds) ? `${(seconds / 3600).toFixed(1)} h` : '--'
+}
+
+function uvStatus(value) {
+  if (!Number.isFinite(value)) return '紫外线 --'
+  if (value < 3) return '紫外线较低'
+  if (value < 6) return '紫外线中等'
+  if (value < 8) return '紫外线偏强'
+  return '紫外线很强'
+}
+
+function visibilityStatus(value) {
+  const km = Number(value) / 1000
+  if (!Number.isFinite(km)) return '能见度 --'
+  if (km >= 10) return '能见度良好'
+  if (km >= 4) return '能见度一般'
+  return '能见度偏低'
+}
+
+function radiationStatus(value) {
+  if (!Number.isFinite(value)) return '辐射 --'
+  if (value >= 650) return '日照很强'
+  if (value >= 300) return '日照中等'
+  if (value > 0) return '日照偏弱'
+  return '夜间或无直射'
+}
+
+function formatDirection(degrees) {
+  if (!Number.isFinite(degrees)) return '--'
+  return ['北', '东北', '东', '东南', '南', '西南', '西', '西北'][Math.round(degrees / 45) % 8]
+}
+
+function rounded(value, digits = 0) {
+  return Number.isFinite(value) ? value.toFixed(digits) : '--'
+}
+</script>
+
+<template>
+  <canvas ref="roadCanvas" class="road-backdrop" aria-hidden="true"></canvas>
+
+  <main class="app-shell">
+    <header class="brand-header">
+      <div class="brand-title-row">
+        <div class="brand-skin" aria-hidden="true">
+          <McSkinViewer
+            :skin="activeSkin"
+            :slim="skinSlim"
+            :scale="skinScale"
+            :show-second-layer="skinSecondLayer"
+            :pose="skinPose"
+            :auto-rotate="skinAutoRotate"
+            :interactive="true"
+            :yaw="-18"
+            :pitch="8"
+            background="transparent"
+            @error="handleSkinError"
+          />
+        </div>
+        <h1><span class="brand-title-texture">Mc</span> Weather</h1>
+      </div>
+    </header>
+
+    <section class="control-card" :class="{ 'is-settings': controlPage === 'settings' }">
+      <Transition name="fade" mode="out-in">
+        <div v-if="controlPage === 'location'" key="location" class="control-section control-location">
+          <header class="control-card__header">
+            <div class="place-hero">
+              <span class="material-symbols-outlined" aria-hidden="true">location_on</span>
+              <div>
+                <strong>{{ placeTitle }}</strong>
+                <small>{{ placeMeta }} · 更新 {{ nowDisplay }}</small>
+              </div>
+            </div>
+
+            <div class="control-actions">
+              <button class="square-action" type="button" :disabled="loading" @click="playUiSound('button'); refreshWeather()" aria-label="刷新">
+                <McTooltip content="刷新" placement="top">
+                  <span class="material-symbols-outlined" aria-hidden="true">refresh</span>
+                </McTooltip>
+              </button>
+              <button class="square-action" type="button" @click="playUiSound(); controlPage = 'settings'" aria-label="设置">
+                <McTooltip content="设置" placement="top">
+                  <span class="material-symbols-outlined" aria-hidden="true">tune</span>
+                </McTooltip>
+              </button>
+            </div>
+          </header>
+
+          <div class="control-card__body">
+            <div class="search-row">
+              <div class="search-box" :class="{ 'is-error': searchMiss }">
+                <span class="material-symbols-outlined" aria-hidden="true">search</span>
+                <input
+                  v-model="query"
+                  type="text"
+                  :placeholder="searchMiss ? '找不到位置，请换个关键词' : '搜索城市、地区或邮编'"
+                  @keydown.enter="chooseFirstPlace"
+                />
+                <button class="clear-action" :class="{ 'is-hidden': !query }" type="button" @click="clearSearch" aria-label="清除搜索">
+                  <McTooltip content="清除搜索" placement="bottom">
+                    <span class="material-symbols-outlined" aria-hidden="true">close</span>
+                  </McTooltip>
+                </button>
+                <button class="square-action inline-action" type="button" :disabled="locating" @click="playUiSound(); useMyLocation()" aria-label="定位">
+                  <McTooltip content="定位" placement="bottom">
+                    <span class="material-symbols-outlined" aria-hidden="true">my_location</span>
+                  </McTooltip>
+                </button>
+                <button class="square-action inline-action" type="button" @click="playUiSound('button'); chooseFirstPlace()" aria-label="搜索">
+                  <McTooltip content="搜索" placement="bottom">
+                    <span class="material-symbols-outlined" aria-hidden="true">arrow_forward</span>
+                  </McTooltip>
+                </button>
+              </div>
+
+              <Transition name="fade">
+                <div v-if="places.length" class="place-results">
+                  <button v-for="place in places" :key="place.id" type="button" @click="choosePlace(place)">
+                    <strong>{{ formatPlace(place) }}</strong>
+                    <span>{{ place.latitude.toFixed(3) }}, {{ place.longitude.toFixed(3) }}</span>
+                  </button>
+                </div>
+              </Transition>
+            </div>
+          </div>
+        </div>
+
+        <div v-else key="settings" class="control-section settings-content">
+          <header class="control-card__header">
+            <div class="place-hero">
+              <span class="material-symbols-outlined" aria-hidden="true">tune</span>
+              <div>
+                <strong>设置</strong>
+              </div>
+            </div>
+            <button class="square-action settings-back" type="button" @click="playUiSound('close'); controlPage = 'location'" aria-label="返回">
+              <McTooltip content="返回" placement="left">
+                <span class="material-symbols-outlined" aria-hidden="true">arrow_back</span>
+              </McTooltip>
+            </button>
+          </header>
+
+          <div class="control-card__body settings-body">
+            <div class="setting-row default-place-row">
+              <span>默认位置</span>
+              <div class="setting-actions">
+                <strong class="default-place-value">{{ defaultPlaceTitle }}</strong>
+                <button class="square-action" type="button" @click="playUiSound('button'); saveDefaultPlace()" aria-label="保存当前地点">
+                  <McTooltip content="保存当前地点" placement="bottom">
+                    <span class="material-symbols-outlined" aria-hidden="true">bookmark_add</span>
+                  </McTooltip>
+                </button>
+                <button class="square-action" type="button" :disabled="!savedDefaultPlace" @click="playUiSound(); clearDefaultPlace()" aria-label="清除默认地点">
+                  <McTooltip content="清除默认地点" placement="bottom">
+                    <span class="material-symbols-outlined" aria-hidden="true">bookmark_remove</span>
+                  </McTooltip>
+                </button>
+              </div>
+            </div>
+            <div class="setting-row theme-mode-row">
+              <span>颜色模式</span>
+              <McRadioGroup v-model="themeMode" :options="themeOptions" />
+            </div>
+            <div class="setting-row skin-row">
+              <span>角色皮肤</span>
+              <McButton icon="mc-players" @click="openSkinModal">编辑角色</McButton>
+            </div>
+            <label class="setting-row">
+              <span>自动刷新</span>
+              <McSwitch v-model="autoRefresh" />
+            </label>
+            <label class="setting-row">
+              <span>刷新间隔</span>
+              <McDropdown v-model="refreshOptionIndex" :options="refreshOptions" />
+            </label>
+            <label class="setting-row api-row">
+              <span>OWM Key</span>
+              <input v-model="owmApiKey" type="password" placeholder="OpenWeatherMap API Key" />
+            </label>
+          </div>
+        </div>
+      </Transition>
+    </section>
+
+    <Transition name="fade">
+      <p v-if="error" class="error-line">{{ error }}</p>
+    </Transition>
+
+    <Transition name="slide-fade" mode="out-in">
+      <section v-if="current" :key="selectedPlace.name + current.time" class="hero-grid">
+        <McPanel class="current-panel" title="CURRENT" bordered elevated>
+          <div class="current-metrics">
+            <div class="condition-block">
+              <div class="weather-icon">
+                <span class="material-symbols-outlined" aria-hidden="true">{{ weatherIcon }}</span>
+              </div>
+              <p class="condition">{{ current.label }}</p>
+            </div>
+            <div class="temp-stack">
+              <span class="temp">{{ rounded(current.temp) }}°</span>
+            </div>
+          </div>
+          <p class="current-brief">{{ currentBrief }}</p>
+          <div class="quick-grid">
+            <span v-for="item in overviewMetrics" :key="item[0]">{{ item[0] }} <b>{{ item[1] }}</b></span>
+          </div>
+        </McPanel>
+
+        <McPanel class="cei-panel" title="CEI INDEX" :style="{ '--cei-tone': ceiTone }" bordered elevated>
+          <div class="cei-card">
+            <div class="cei-score" :style="{ '--score': cei.cei }">
+              <span>{{ cei.cei }}</span>
+            </div>
+            <div class="cei-summary">
+              <p class="cei-level-title">{{ ceiLevelTitle }}</p>
+              <p v-if="ceiLevelDescription">{{ ceiLevelDescription }}</p>
+              <p>主要影响：{{ mainEffect }}</p>
+            </div>
+            <p v-if="!riskFactors.length" class="current-brief cei-brief">{{ ceiAdvice }}</p>
+            <div v-else class="tag-row">
+              <span v-for="tag in riskFactors" :key="tag">{{ tag }}</span>
+            </div>
+            <div class="cei-score-bars">
+              <div v-for="(value, key) in cei.components" :key="key" class="mini-progress-row">
+                <span>{{ { heat: '热舒适', air: '空气', uv: '紫外线', pressure: '气压', risk: '风险' }[key] }}</span>
+                <McProgress :value="value" :show-value="false" />
+                <b>{{ value }}</b>
+              </div>
+            </div>
+          </div>
+        </McPanel>
+
+        <McPanel class="radar-panel" title="RADAR MAP" bordered elevated>
+          <div class="leaflet-map-wrap">
+            <div class="radar-map-controls">
+              <button type="button" aria-label="放大地图" @click="zoomMap(1)">
+                <span aria-hidden="true">+</span>
+              </button>
+              <button type="button" aria-label="缩小地图" @click="zoomMap(-1)">
+                <span aria-hidden="true">−</span>
+              </button>
+              <button
+                type="button"
+                :disabled="!owmApiKey"
+                :aria-label="`切换图层：${currentOwmLayerLabel}`"
+                @click="cycleOwmLayer"
+              >
+                <McTooltip :content="`图层：${currentOwmLayerLabel}`" placement="right">
+                  <span class="material-symbols-outlined" aria-hidden="true">layers</span>
+                </McTooltip>
+              </button>
+            </div>
+            <div ref="mapElement" class="leaflet-map"></div>
+            <p v-if="!owmApiKey" class="map-note">在设置里输入 OWM Key 后启用 OpenWeatherMap 图层</p>
+          </div>
+        </McPanel>
+      </section>
+
+      <section v-else class="loading-state">
+        <div class="loader">
+          <img id="spinner_img" :src="loadingSpinnerSrc" alt="" />
+        </div>
+        <p>正在加载天气数据</p>
+      </section>
+    </Transition>
+
+    <McButtonTabs v-model="activeTab" :items="tabs" class="tabs" />
+
+    <Transition name="slide-fade" mode="out-in">
+      <section v-if="activeTab === 'current' && current" key="current" class="content-grid">
+        <McPanel v-for="item in [
+          ['UVI', rounded(current.uvi, 1), uvStatus(current.uvi)],
+          ['能见度', `${rounded(current.visibility / 1000, 1)} km`, visibilityStatus(current.visibility)],
+          ['日出 - 日落', `${formatTime(weather.daily[0]?.sunrise)} - ${formatTime(weather.daily[0]?.sunset)}`, `白昼 ${formatDurationHours(weather.daily[0]?.daylightDuration)}`],
+          ['短波辐射', `${rounded(current.radiation)} W/m²`, radiationStatus(current.radiation)],
+        ]" :key="item[0]" :title="item[0]" :subtitle="item[2]" bordered>
+          <p class="metric-value">{{ item[1] }}</p>
+        </McPanel>
+      </section>
+
+      <section v-else-if="activeTab === 'minute' && weather" key="minute" class="chart-panel">
+        <McPanel title="未来 15 分钟级趋势" subtitle="温度与降水" bordered>
+          <div class="chart-wrap" @mouseleave="hideMinuteTooltip">
+            <canvas ref="minuteCanvas"></canvas>
+            <div
+              v-if="minuteTooltip.visible"
+              class="chart-tooltip-panel"
+              :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
+            >
+              <strong>{{ minuteTooltip.title }}</strong>
+              <span v-for="item in minuteTooltip.items" :key="item.label" class="chart-tooltip-row">
+                <i :style="{ backgroundColor: item.color }"></i>
+                <b>{{ item.label }}</b>
+                <em>{{ item.value }}</em>
+              </span>
+            </div>
+          </div>
+        </McPanel>
+      </section>
+
+      <section v-else-if="activeTab === 'forecast' && weather" key="forecast" class="forecast-grid">
+        <article v-for="day in weather.daily" :key="day.time" class="forecast-card">
+          <div class="forecast-head">
+            <div class="forecast-day">
+              <time>
+                <span>{{ formatForecastDate(day.time) }}</span>
+                <b>{{ formatForecastWeek(day.time) }}</b>
+              </time>
+              <strong>{{ day.label }}</strong>
+            </div>
+            <div class="forecast-temp">
+              <span>{{ rounded(day.tempMin) }}°</span>
+              <i></i>
+              <span>{{ rounded(day.tempMax) }}°</span>
+            </div>
+          </div>
+
+          <div class="forecast-groups">
+            <div class="forecast-group">
+              <b>体感</b>
+              <span>{{ rounded(day.feelsMin) }}° / {{ rounded(day.feelsMax) }}°</span>
+            </div>
+            <div class="forecast-group">
+              <b>降水</b>
+              <span>{{ rounded(day.precipitation, 1) }} mm · {{ rounded(day.precipitationProbability) }}%</span>
+              <small>{{ rounded(day.precipitationHours, 1) }} h</small>
+            </div>
+            <div class="forecast-group">
+              <b>风</b>
+              <span>{{ rounded(day.windMax) }} km/h</span>
+              <small>{{ formatDirection(day.windDirection) }} · 阵风 {{ rounded(day.windGustMax) }}</small>
+            </div>
+            <div class="forecast-group">
+              <b>天光</b>
+              <span>UV {{ rounded(day.uvMax, 1) }}</span>
+              <small>日照 {{ formatDurationHours(day.sunshineDuration) }}</small>
+            </div>
+          </div>
+
+          <div class="sun-cycle" aria-label="日出日落">
+            <svg viewBox="0 0 220 70" aria-hidden="true">
+              <path class="sun-cycle__ground" d="M18 56 H202" />
+              <path class="sun-cycle__arc" d="M26 56 C68 8 152 8 194 56" />
+            </svg>
+            <span class="sun-cycle__icon sun-cycle__icon--sun material-symbols-outlined">wb_sunny</span>
+            <span class="sun-cycle__icon sun-cycle__icon--moon material-symbols-outlined">dark_mode</span>
+            <div class="sun-cycle__time sun-cycle__time--rise">
+              <b>日出</b>
+              <span>{{ formatTime(day.sunrise) }}</span>
+            </div>
+            <div class="sun-cycle__time sun-cycle__time--set">
+              <b>日落</b>
+              <span>{{ formatTime(day.sunset) }}</span>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section v-else-if="activeTab === 'advice' && cei" key="advice" class="advice-grid">
+        <McPanel title="天气建议" subtitle="今日出行简报" bordered>
+          <p class="advice-text">{{ summaryText }}</p>
+        </McPanel>
+        <McPanel title="行动提醒" subtitle="按风险优先级整理" bordered>
+          <div class="advice-list">
+            <span><b>空气</b>AQI {{ rounded(aqiSummary.value) }}，{{ aqiSummary.label }}</span>
+            <span><b>降水</b>{{ rounded(current.precipitationProbability) }}% 概率，{{ current.precipitationProbability >= 50 ? '带伞更稳' : '短时影响较低' }}</span>
+            <span><b>风力</b>阵风 {{ rounded(current.windGust * 3.6) }} km/h，{{ current.windGust * 3.6 >= 25 ? '注意固定随身物品' : '通勤影响不明显' }}</span>
+            <span><b>舒适</b>CEI {{ cei.cei }}，{{ ceiAdvice }}</span>
+          </div>
+        </McPanel>
+      </section>
+    </Transition>
+
+    <McModal v-model:open="skinModalOpen" title="角色皮肤" :close-on-overlay="true" :show-close="false">
+      <div class="skin-modal">
+        <div class="skin-preview">
+          <McSkinViewer
+            :skin="activeSkin"
+            :slim="skinSlim"
+            :scale="previewSkinScale"
+            :show-second-layer="skinSecondLayer"
+            :pose="skinPose"
+            :auto-rotate="skinAutoRotate"
+            :interactive="true"
+            :yaw="-18"
+            :pitch="8"
+            background="transparent"
+            @error="handleSkinError"
+          />
+        </div>
+        <div class="skin-settings">
+          <div class="skin-setting-row skin-file-row">
+            <span aria-hidden="true"></span>
+            <div class="skin-file-controls">
+              <input ref="skinFileInput" class="skin-file-input" type="file" accept="image/png,image/*" @change="handleSkinFileChange" />
+              <McButton icon="mc-folder-open" @click="chooseSkinFile">选择皮肤文件</McButton>
+            </div>
+          </div>
+          <div class="skin-setting-row">
+            <span>Slim 体型</span>
+            <McSwitch v-model="skinSlim" />
+          </div>
+          <div class="skin-setting-row">
+            <span>第二层装饰</span>
+            <McSwitch v-model="skinSecondLayer" />
+          </div>
+          <div class="skin-setting-row">
+            <span>自动旋转</span>
+            <McSwitch v-model="skinAutoRotate" />
+          </div>
+          <label class="skin-setting-row skin-pose-row">
+            <span>姿势</span>
+            <McDropdown v-model="skinPoseIndex" :options="skinPoseOptions" />
+          </label>
+          <div class="skin-modal-actions">
+            <McButton icon="mc-reload" @click="resetSkin">恢复默认</McButton>
+            <McButton icon="mc-save" variant="primary" @click="skinModalOpen = false">保存</McButton>
+          </div>
+        </div>
+      </div>
+    </McModal>
+
+    <footer class="app-footer">
+      <div class="footer-inner">
+        <div class="footer-brand-row">
+          <img src="/icon.png" alt="" />
+          <div class="footer-brand-copy">
+            <strong>MC Weather</strong>
+            <span>一款受 Minecraft 启发的像素风格天气应用，把天空装进方块世界。</span>
+          </div>
+        </div>
+        <div class="footer-divider" aria-hidden="true"></div>
+        <div class="footer-meta">
+          <div class="footer-actions">
+            <a class="footer-source" href="https://github.com/iMallpa/MC-Weather" target="_blank" rel="noreferrer" aria-label="View source on GitHub">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true">
+                <path d="M256 32C132.3 32 32 134.9 32 261.7c0 101.5 64.2 187.5 153.2 217.9a17.6 17.6 0 0 0 3.8.4c8.3 0 11.5-6.1 11.5-11.4 0-5.5-.2-19.9-.3-39.1a102.4 102.4 0 0 1-22.6 2.7c-43.1 0-52.9-33.5-52.9-33.5-10.2-26.5-24.9-33.6-24.9-33.6-19.5-13.7-.1-14.1 1.4-14.1h.1c22.5 2 34.3 23.8 34.3 23.8 11.2 19.6 26.2 25.1 39.6 25.1a63 63 0 0 0 25.6-6c2-14.8 7.8-24.9 14.2-30.7-49.7-5.8-102-25.5-102-113.5 0-25.1 8.7-45.6 23-61.6-2.3-5.8-10-29.2 2.2-60.8a18.6 18.6 0 0 1 5-.5c8.1 0 26.4 3.1 56.6 24.1a208.2 208.2 0 0 1 112.2 0c30.2-21 48.5-24.1 56.6-24.1a18.6 18.6 0 0 1 5 .5c12.2 31.6 4.5 55 2.2 60.8 14.3 16.1 23 36.6 23 61.6 0 88.2-52.4 107.6-102.3 113.3 8 7.1 15.2 21.1 15.2 42.5 0 30.7-.3 55.5-.3 63 0 5.4 3.1 11.5 11.4 11.5a19.4 19.4 0 0 0 4-.4C415.9 449.2 480 363.1 480 261.7 480 134.9 379.7 32 256 32" />
+              </svg>
+              <span>View source on GitHub</span>
+            </a>
+            <span class="footer-license">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" aria-hidden="true">
+                <path d="M80-120v-80h360v-447q-26-9-45-28t-28-45H240l120 280q0 50-41 85t-99 35q-58 0-99-35t-41-85l120-280h-80v-80h247q12-35 43-57.5t70-22.5q39 0 70 22.5t43 57.5h247v80h-80l120 280q0 50-41 85t-99 35q-58 0-99-35t-41-85l120-280H593q-9 26-28 45t-45 28v447h360v80H80Zm585-320h150l-75-174-75 174Zm-520 0h150l-75-174-75 174Zm335-280q17 0 28.5-11.5T520-760q0-17-11.5-28.5T480-800q-17 0-28.5 11.5T440-760q0 17 11.5 28.5T480-720Z" />
+              </svg>
+              <span>MIT License</span>
+            </span>
+          </div>
+          <p>本项目的构建离不开 mcui-oreui、city-roads 与 CWC CEI (Comfort Environment Index) 等开源项目的启发和支持，也感谢 Open-Meteo、OpenWeatherMap 与 OpenStreetMap 提供的天气数据、地图图层与开放地图服务。</p>
+          <div class="footer-legal">
+            <p>Minecraft 相关商标归 Mojang Studios、Microsoft 及相关权利方所有。本项目为非官方开源作品，未获其授权、认可或赞助。</p>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </main>
+</template>
