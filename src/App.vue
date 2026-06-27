@@ -79,6 +79,10 @@ let hourlyChart = null
 let windChart = null
 let licenseClickCount = 0
 let licenseClickTimer = 0
+let roadFallbackImage = null
+let roadFallbackTheme = ''
+let roadFallbackLoading = null
+let roadFallbackLoadingTheme = ''
 let resizeObserver = null
 let leafletMap = null
 let baseLayer = null
@@ -1010,28 +1014,67 @@ function drawRoadBackdrop() {
     return
   }
 
-  const seed = Math.abs(Math.sin(Number(selectedPlace.value.latitude) * 13.37 + Number(selectedPlace.value.longitude) * 7.91))
-  for (let i = 0; i < 42; i += 1) {
-    const lane = ((i * 73 + seed * 400) % (width + height)) - height * 0.35
-    ctx.lineWidth = i % 7 === 0 ? 2.8 : 1
-    ctx.beginPath()
-    ctx.moveTo(lane + roadOffsetX, height + roadOffsetY)
-    const midX = lane + roadOffsetX + height * 0.55 + Math.sin(i + seed) * 90
-    const midY = height * 0.48 + roadOffsetY + Math.cos(i * 1.7) * 120
-    ctx.lineTo(midX, midY)
-    ctx.lineTo(lane + roadOffsetX + height * 1.1, roadOffsetY)
-    ctx.stroke()
+  drawRoadFallbackSvg(ctx, width, height, roadOffsetX, roadOffsetY, isDark)
+}
+
+function drawRoadFallbackSvg(ctx, width, height, roadOffsetX, roadOffsetY, isDark) {
+  if (!roadFallbackImage || roadFallbackTheme !== (isDark ? 'dark' : 'light')) {
+    loadRoadFallbackSvg(isDark).then(() => drawRoadBackdrop())
+    return
   }
 
-  for (let i = 0; i < 22; i += 1) {
-    const y = ((i * 97 + seed * 300) % height) + roadOffsetY
-    ctx.lineWidth = i % 5 === 0 ? 2 : 1
-    ctx.beginPath()
-    ctx.moveTo(width * 0.05 + roadOffsetX, y)
-    ctx.lineTo(width * 0.55 + roadOffsetX + Math.sin(i) * 160, y - width * 0.28)
-    ctx.lineTo(width * 1.1 + roadOffsetX, y - width * 0.1)
-    ctx.stroke()
-  }
+  const sourceWidth = 2560.5
+  const sourceHeight = 1347
+  const scale = Math.max(width / sourceWidth, height / sourceHeight) * 1.18
+  const drawWidth = sourceWidth * scale
+  const drawHeight = sourceHeight * scale
+  const x = (width - drawWidth) / 2 + roadOffsetX * 0.42
+  const y = (height - drawHeight) / 2 + roadOffsetY
+
+  ctx.save()
+  ctx.globalAlpha = isDark ? 0.64 : 0.52
+  ctx.drawImage(roadFallbackImage, x, y, drawWidth, drawHeight)
+  ctx.restore()
+}
+
+async function loadRoadFallbackSvg(isDark) {
+  const theme = isDark ? 'dark' : 'light'
+  if (roadFallbackImage && roadFallbackTheme === theme) return
+  if (roadFallbackLoading && roadFallbackLoadingTheme === theme) return roadFallbackLoading
+
+  roadFallbackLoadingTheme = theme
+  roadFallbackLoading = fetch(assetUrl('kennedy-town.svg'))
+    .then((response) => response.text())
+    .then((svg) => {
+      const themedSvg = svg
+        .replace(/<rect id="background"[^>]*>/, '<rect id="background" fill="transparent" x="0" y="0" width="2560.5" height="1347"></rect>')
+        .replace(/<g id="lines"[^>]*>/, `<g id="lines" fill="none" stroke-width="${isDark ? 1.05 : 0.95}" stroke="${isDark ? '#9fb196' : '#4c574d'}" stroke-opacity="${isDark ? 0.58 : 0.46}">`)
+      return new Promise((resolve, reject) => {
+        const image = new Image()
+        const url = URL.createObjectURL(new Blob([themedSvg], { type: 'image/svg+xml' }))
+        image.onload = () => {
+          URL.revokeObjectURL(url)
+          roadFallbackImage = image
+          roadFallbackTheme = theme
+          resolve()
+        }
+        image.onerror = () => {
+          URL.revokeObjectURL(url)
+          reject(new Error('Unable to load road fallback SVG'))
+        }
+        image.src = url
+      })
+    })
+    .catch(() => {
+      roadFallbackImage = null
+      roadFallbackTheme = ''
+    })
+    .finally(() => {
+      roadFallbackLoading = null
+      roadFallbackLoadingTheme = ''
+    })
+
+  return roadFallbackLoading
 }
 
 function formatPlace(place) {

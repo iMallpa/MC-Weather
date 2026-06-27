@@ -9,5 +9,13 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['mcui-oreui'],
   },
-  plugins: [vue()],
+  plugins: [
+    vue({
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag) => tag === 'modal_area',
+        },
+      },
+    }),
+  ],
 })
