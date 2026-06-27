@@ -13,7 +13,7 @@ export default defineConfig({
     vue({
       template: {
         compilerOptions: {
-          isCustomElement: (tag) => tag === 'modal_area',
+          isCustomElement: (tag) => ['modal', 'modal_area', 'modal_title', 'modal_title_area', 'modal_close_btn'].includes(tag),
         },
       },
     }),

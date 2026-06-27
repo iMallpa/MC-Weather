@@ -3,7 +3,7 @@ import { Chart, registerables } from 'chart.js'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { McButton, McButtonTabs, McDropdown, McModal, McPanel, McProgress, McRadioGroup, McSkinViewer, McSwitch, McTooltip, playSound } from 'mcui-oreui'
+import { McButton, McButtonTabs, McDropdown, McIcon, McModal, McPanel, McProgress, McRadioGroup, McSkinViewer, McSwitch, McTooltip, playSound } from 'mcui-oreui'
 import { DEFAULT_PLACE, loadWeather, reverseGeocodePlace, searchPlaces } from './services/weather.js'
 
 Chart.register(...registerables)
@@ -88,6 +88,8 @@ let leafletMap = null
 let baseLayer = null
 let weatherLayer = null
 let locationMarker = null
+let mapPickMarker = null
+let mapPickPlace = null
 let mapHost = null
 let themeMediaQuery = null
 let themeChangeHandler = null
@@ -157,13 +159,17 @@ const mainEffect = computed(() => ({
 }[cei.value?.detail.main_effect] ?? '综合环境'))
 const weatherIcon = computed(() => {
   const code = current.value?.weatherCode
-  if ([0, 1].includes(code)) return current.value?.isDay === 0 ? 'clear_night' : 'clear_day'
-  if ([2, 3].includes(code)) return 'cloud'
-  if ([45, 48].includes(code)) return 'foggy'
-  if (code >= 51 && code <= 67) return 'rainy'
-  if (code >= 71 && code <= 86) return 'weather_snowy'
-  if (code >= 95) return 'thunderstorm'
-  return 'partly_cloudy_day'
+  if ([0, 1].includes(code)) return current.value?.isDay === 0 ? 'mdi-weather-night' : 'mdi-weather-sunny'
+  if (code === 2) return 'mdi-weather-partly-cloudy'
+  if (code === 3) return 'mdi-weather-cloudy'
+  if ([45, 48].includes(code)) return 'mdi-weather-fog'
+  if (code >= 51 && code <= 57) return 'mdi-weather-partly-rainy'
+  if (code >= 61 && code <= 67) return 'mdi-weather-pouring'
+  if (code >= 71 && code <= 77) return 'mdi-weather-snowy'
+  if (code >= 80 && code <= 82) return 'mdi-weather-rainy'
+  if (code >= 85 && code <= 86) return 'mdi-weather-snowy-heavy'
+  if (code >= 95) return 'mdi-weather-lightning-rainy'
+  return 'mdi-weather-partly-cloudy'
 })
 const riskFactors = computed(() => {
   const labels = {
@@ -205,12 +211,108 @@ const aqiSummary = computed(() => {
   return { value: aqi, label: '差', scale: 'AQI', bad: true }
 })
 const summaryText = computed(() => {
-  if (!current.value || !cei.value) return ''
-  const rain = current.value.precipitationProbability >= 50 ? '降水概率偏高，建议带伞。' : '短时降水概率不高。'
-  const wind = current.value.windGust * 3.6 >= 25 ? '阵风较明显，注意固定随身物品。' : '风力整体温和。'
-  const air = aqiSummary.value.bad ? '空气质量一般，敏感人群减少长时间户外活动。' : '空气质量处于可接受范围。'
-  return `${placeTitle.value} 当前 ${current.value.label}，气温 ${rounded(current.value.temp)}°C，体感 ${rounded(current.value.feelsLike)}°C。CEI 为 ${cei.value.cei}，主要影响来自 ${mainEffect.value}。${rain}${wind}${air}`
+  return adviceSummary.value
 })
+const adviceSummary = computed(() => {
+  if (!current.value || !cei.value) return ''
+  const core = [
+    `${placeTitle.value} 当前 ${current.value.label}`,
+    `气温 ${rounded(current.value.temp)}°C`,
+    `体感 ${rounded(current.value.feelsLike)}°C`,
+    `CEI ${cei.value.cei}`,
+  ].join('，')
+  const top = adviceItems.value.find((item) => item.level === 'priority') || adviceItems.value[0]
+  const second = adviceItems.value.find((item) => item.level === 'notice' && item !== top)
+  const tail = [top?.text, second?.text].filter(Boolean).join(' ')
+  return `${core}。主要影响来自 ${mainEffect.value}。${tail}`
+})
+const adviceItems = computed(() => {
+  if (!current.value || !cei.value) return []
+  const items = []
+  const rainChance = Number(current.value.precipitationProbability) || 0
+  const rainNow = Number(current.value.precipitation) || 0
+  const wind = (Number(current.value.wind) || 0) * 3.6
+  const gust = (Number(current.value.windGust) || 0) * 3.6
+  const feels = Number(current.value.feelsLike)
+  const uvi = Number(current.value.uvi)
+  const visibility = Number(current.value.visibility)
+  const code = Number(current.value.weatherCode)
+  const humidity = Number(current.value.humidity)
+
+  if (rainChance >= 70 || rainNow >= 2) {
+    items.push(adviceItem('降水', 'priority', `降水信号明显，出门带伞，骑行和步行都要预留时间。`))
+  } else if (rainChance >= 40 || rainNow > 0) {
+    items.push(adviceItem('降水', 'notice', `短时有降水可能，建议随身带轻便雨具。`))
+  } else {
+    items.push(adviceItem('降水', 'stable', `短时降水影响较低，正常出行即可。`))
+  }
+
+  if (gust >= 45 || wind >= 30) {
+    items.push(adviceItem('风力', 'priority', `风力偏强，避免在广告牌、树下和临时搭建物附近停留。`))
+  } else if (gust >= 25 || wind >= 18) {
+    items.push(adviceItem('风力', 'notice', `阵风略明显，帽子、伞和轻物品注意固定。`))
+  } else {
+    items.push(adviceItem('风力', 'stable', `风力平稳，对通勤影响不大。`))
+  }
+
+  if (Number.isFinite(feels) && feels >= 33) {
+    items.push(adviceItem('体感', 'priority', `体感炎热，减少暴晒时段活动，及时补水。`))
+  } else if (Number.isFinite(feels) && feels <= 3) {
+    items.push(adviceItem('体感', 'priority', `体感寒冷，注意保暖，长时间户外需要加厚外层。`))
+  } else if (Number.isFinite(feels) && (feels >= 29 || feels <= 8)) {
+    items.push(adviceItem('体感', 'notice', `体感略有压力，按活动时间调整衣物和补水。`))
+  } else {
+    items.push(adviceItem('体感', 'stable', `体感处于可接受范围，日常活动压力不高。`))
+  }
+
+  if (aqiSummary.value.bad) {
+    items.push(adviceItem('空气', 'priority', `空气质量偏弱，敏感人群减少长时间户外运动。`))
+  } else {
+    items.push(adviceItem('空气', 'stable', `空气质量整体可接受，正常通风和户外活动即可。`))
+  }
+
+  if (Number.isFinite(uvi) && uvi >= 8) {
+    items.push(adviceItem('紫外线', 'priority', `紫外线很强，外出使用防晒并减少正午暴露。`))
+  } else if (Number.isFinite(uvi) && uvi >= 5) {
+    items.push(adviceItem('紫外线', 'notice', `紫外线中等偏强，长时间户外建议防晒。`))
+  }
+
+  if (Number.isFinite(visibility) && visibility < 3000) {
+    items.push(adviceItem('能见度', 'priority', `能见度偏低，驾驶注意车距和灯光。`))
+  } else if (Number.isFinite(visibility) && visibility < 8000) {
+    items.push(adviceItem('能见度', 'notice', `能见度一般，夜间和快速路段注意观察。`))
+  }
+
+  if (code >= 95) {
+    items.push(adviceItem('雷暴', 'priority', `存在雷暴风险，避免开阔地、水边和高处停留。`))
+  } else if ((code >= 71 && code <= 86) || riskFactors.value.includes('雪冰')) {
+    items.push(adviceItem('路面', 'priority', `可能有雪或结冰影响，注意防滑和路面变化。`))
+  } else if ([45, 48].includes(code)) {
+    items.push(adviceItem('雾', 'notice', `有雾或低云影响，通勤注意能见度变化。`))
+  }
+
+  if (humidity >= 85 && feels >= 26) {
+    items.push(adviceItem('湿度', 'notice', `湿度偏高，闷热感会更明显，室内注意通风除湿。`))
+  }
+
+  const ceiScore = Number(cei.value.cei) || 0
+  if (ceiScore < 40) {
+    items.push(adviceItem('舒适度', 'priority', `环境压力较高，非必要减少户外停留。`))
+  } else if (ceiScore < 60) {
+    items.push(adviceItem('舒适度', 'notice', `舒适度偏低，安排户外活动时留意主要影响项。`))
+  } else {
+    items.push(adviceItem('舒适度', 'stable', `舒适度可接受，按常规计划安排即可。`))
+  }
+
+  const order = { priority: 0, notice: 1, stable: 2 }
+  return items
+    .filter((item, index, list) => list.findIndex((other) => other.title === item.title) === index)
+    .sort((a, b) => order[a.level] - order[b.level])
+    .slice(0, 8)
+})
+function adviceItem(title, level, text) {
+  return { title, level, text }
+}
 const currentBrief = computed(() => {
   if (!current.value) return ''
   const rain = current.value.precipitationProbability >= 40 ? '短时有降水可能' : '短时降水不明显'
@@ -790,6 +892,8 @@ function initLeafletMap() {
     baseLayer = null
     weatherLayer = null
     locationMarker = null
+    mapPickMarker = null
+    mapPickPlace = null
   }
   mapHost = mapElement.value
   const lat = Number(selectedPlace.value.latitude || DEFAULT_PLACE.latitude)
@@ -799,6 +903,8 @@ function initLeafletMap() {
     attributionControl: false,
   }).setView([lat, lon], 7)
   L.control.attribution({ prefix: false }).addTo(leafletMap)
+  leafletMap.on('click', handleMapClick)
+  leafletMap.on('popupopen', bindMapPopupAction)
   updateLeafletMap()
 }
 
@@ -838,6 +944,81 @@ function updateLeafletMap() {
     }),
   }).addTo(leafletMap)
   window.setTimeout(() => leafletMap.invalidateSize(), 80)
+}
+
+async function handleMapClick(event) {
+  if (!leafletMap || !event?.latlng) return
+  const latitude = Number(event.latlng.lat.toFixed(4))
+  const longitude = Number(normalizeLongitude(event.latlng.lng).toFixed(4))
+  const normalizedLatLng = L.latLng(latitude, longitude)
+  const pendingPlace = { name: '地图选点', country: '', latitude, longitude, timezone: 'auto' }
+  mapPickPlace = pendingPlace
+  showMapPickPopup(normalizedLatLng, pendingPlace, true)
+
+  try {
+    const place = await reverseGeocodePlace(latitude, longitude, openWeatherOptions.value)
+    mapPickPlace = { ...place, latitude, longitude }
+    showMapPickPopup(normalizedLatLng, mapPickPlace, false)
+  } catch {
+    showMapPickPopup(normalizedLatLng, pendingPlace, false)
+  }
+}
+
+function normalizeLongitude(longitude) {
+  const value = Number(longitude)
+  if (!Number.isFinite(value)) return 0
+  return ((((value + 180) % 360) + 360) % 360) - 180
+}
+
+function showMapPickPopup(latlng, place, loadingPlace = false) {
+  if (!leafletMap) return
+  if (mapPickMarker) leafletMap.removeLayer(mapPickMarker)
+  mapPickMarker = L.marker(latlng, {
+    icon: L.divIcon({
+      className: 'square-map-marker square-map-marker--pick',
+      iconSize: [16, 16],
+      iconAnchor: [8, 8],
+    }),
+  }).addTo(leafletMap)
+
+  const title = escapeHtml(formatPlace(place) || '地图选点')
+  const coords = `${Number(place.latitude).toFixed(4)}, ${Number(place.longitude).toFixed(4)}`
+  const popup = L.popup({
+    className: 'map-weather-popup',
+    closeButton: false,
+    autoPan: true,
+    offset: [0, -12],
+  })
+    .setLatLng(latlng)
+    .setContent(`
+      <div class="map-weather-popup__box">
+        <strong>${title}</strong>
+        <span>${coords}</span>
+        <button class="map-weather-popup__button" type="button" ${loadingPlace ? 'disabled' : ''}>查看天气</button>
+      </div>
+    `)
+  popup.openOn(leafletMap)
+}
+
+function bindMapPopupAction(event) {
+  const button = event.popup?.getElement()?.querySelector('.map-weather-popup__button')
+  if (!button) return
+  button.addEventListener('click', () => {
+    if (!mapPickPlace || button.disabled) return
+    playUiSound('button')
+    refreshWeather(mapPickPlace)
+    leafletMap?.closePopup()
+  }, { once: true })
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char]))
 }
 
 async function loadRoadNetwork() {
@@ -1411,7 +1592,7 @@ function rounded(value, digits = 0) {
           <div class="current-metrics">
             <div class="condition-block">
               <div class="weather-icon">
-                <span class="material-symbols-outlined" aria-hidden="true">{{ weatherIcon }}</span>
+                <McIcon class="weather-icon__glyph" :name="weatherIcon" :size="52" :pixel-size="24" color="#f4f1e8" />
               </div>
               <p class="condition">{{ current.label }}</p>
             </div>
@@ -1612,15 +1793,15 @@ function rounded(value, digits = 0) {
       </section>
 
       <section v-else-if="activeTab === 'advice' && cei" key="advice" class="advice-grid">
-        <McPanel title="天气建议" subtitle="今日出行简报" bordered>
+        <McPanel title="天气建议" subtitle="按当前天气自动生成" bordered>
           <p class="advice-text">{{ summaryText }}</p>
         </McPanel>
-        <McPanel title="行动提醒" subtitle="按风险优先级整理" bordered>
+        <McPanel title="行动提醒" subtitle="按优先级排序" bordered>
           <div class="advice-list">
-            <span><b>空气</b>AQI {{ rounded(aqiSummary.value) }}，{{ aqiSummary.label }}</span>
-            <span><b>降水</b>{{ rounded(current.precipitationProbability) }}% 概率，{{ current.precipitationProbability >= 50 ? '带伞更稳' : '短时影响较低' }}</span>
-            <span><b>风力</b>阵风 {{ rounded(current.windGust * 3.6) }} km/h，{{ current.windGust * 3.6 >= 25 ? '注意固定随身物品' : '通勤影响不明显' }}</span>
-            <span><b>舒适</b>CEI {{ cei.cei }}，{{ ceiAdvice }}</span>
+            <span v-for="item in adviceItems" :key="item.title" :class="`is-${item.level}`">
+              <b>{{ item.title }}</b>
+              <em>{{ item.text }}</em>
+            </span>
           </div>
         </McPanel>
       </section>
