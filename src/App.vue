@@ -1714,7 +1714,7 @@ function rounded(value, digits = 0) {
               <span>MIT License</span>
             </span>
           </div>
-          <p>本项目的构建离不开 mcui-oreui、city-roads 与 CWC CEI (Comfort Environment Index) 等开源项目的启发和支持，也感谢 Open-Meteo、OpenWeatherMap 与 OpenStreetMap 提供的天气数据、地图图层与开放地图服务。</p>
+          <p>本项目的构建离不开 McUI Vue、City Roads 与 CWC CEI (Comfort Environment Index) 等开源项目的启发和支持，也感谢 Open-Meteo、OpenWeatherMap 与 OpenStreetMap 提供的天气数据、地图图层与开放地图服务。</p>
           <div class="footer-legal">
             <p>Minecraft 相关商标归 Mojang Studios、Microsoft 及相关权利方所有。本项目为非官方开源作品，未获其授权、认可或赞助。</p>
           </div>
