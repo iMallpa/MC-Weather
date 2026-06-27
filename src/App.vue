@@ -1054,10 +1054,10 @@ function stepMinutes(rows = []) {
 }
 
 function formatStepLabel(minutes) {
-  if (!minutes) return 'unknown-step'
-  if (minutes < 60) return `${minutes} min-step`
+  if (!minutes) return '未知步长'
+  if (minutes < 60) return `${minutes} 分钟步长`
   const hours = minutes / 60
-  return `${Number.isInteger(hours) ? hours : rounded(hours, 1)} h-step`
+  return `${Number.isInteger(hours) ? hours : rounded(hours, 1)} 小时步长`
 }
 
 function decodeDebugPart(value) {
