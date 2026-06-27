@@ -982,7 +982,7 @@ function drawRoadBackdrop() {
   ctx.lineCap = 'square'
   const isWideCanvas = width > 1180
   const roadOffsetX = isWideCanvas ? 200 : 0
-  const roadOffsetY = isWideCanvas ? -100 : 0
+  const roadOffsetY = isWideCanvas ? -100 : -150
   
   const gradient = ctx.createLinearGradient(width, 0, 0, height)
   gradient.addColorStop(0, isDark ? 'rgba(36,96,42,0.42)' : 'rgba(18,48,34,0.46)')
