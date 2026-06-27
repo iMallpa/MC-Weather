@@ -290,7 +290,8 @@ async function fetchForecast(place) {
   url.searchParams.set('longitude', place.longitude)
   url.searchParams.set('timezone', place.timezone || 'auto')
   url.searchParams.set('forecast_days', '7')
-  url.searchParams.set('past_days', '1')
+  url.searchParams.set('forecast_hours', '48')
+  url.searchParams.set('forecast_minutely_15', '16')
   url.searchParams.set('current', [
     'temperature_2m',
     'relative_humidity_2m',
@@ -423,11 +424,14 @@ function normalizeWeather(place, forecast, air) {
   const current = forecast.current
   const currentTime = current.time
   const currentHour = nearestIndex(forecast.hourly.time, currentTime)
+  const hourlyStart = boundedStartIndex(forecast.hourly.time, currentHour)
+  const minutelyStart = firstIndexAtOrAfter(forecast.minutely_15?.time, currentTime)
   const airHour = nearestIndex(air.hourly.time, currentTime)
   const hourlyAirByTime = new Map((air.hourly.time ?? []).map((time, index) => [time, pickAir(air.hourly, index)]))
 
   const airNow = pickAir(air.hourly, airHour)
-  const hourly = (forecast.hourly.time ?? []).slice(0, 48).map((time, index) => {
+  const hourly = (forecast.hourly.time ?? []).slice(hourlyStart, hourlyStart + 48).map((time, offset) => {
+    const index = hourlyStart + offset
     const itemAir = hourlyAirByTime.get(time) || airNow
     return buildMoment({
       time,
@@ -473,7 +477,9 @@ function normalizeWeather(place, forecast, air) {
     windDirection: current.wind_direction_10m,
   })
 
-  const minutely = (forecast.minutely_15?.time ?? []).slice(0, 16).map((time, index) => ({
+  const minutely = (forecast.minutely_15?.time ?? []).slice(minutelyStart, minutelyStart + 16).map((time, offset) => {
+    const index = minutelyStart + offset
+    return {
     time,
     temp: at(forecast.minutely_15.temperature_2m, index),
     humidity: at(forecast.minutely_15.relative_humidity_2m, index),
@@ -482,7 +488,8 @@ function normalizeWeather(place, forecast, air) {
     label: labelForWeather(at(forecast.minutely_15.weather_code, index)),
     wind: at(forecast.minutely_15.wind_speed_10m, index) / 3.6,
     windGust: at(forecast.minutely_15.wind_gusts_10m, index) / 3.6,
-  }))
+    }
+  })
 
   const daily = (forecast.daily.time ?? []).map((time, index) => ({
     time,
@@ -872,6 +879,18 @@ function nearestIndex(times = [], target) {
     }
   })
   return best
+}
+
+function firstIndexAtOrAfter(times = [], target) {
+  if (!times.length) return 0
+  const targetMs = new Date(target).getTime()
+  const index = times.findIndex((time) => new Date(time).getTime() >= targetMs)
+  return index >= 0 ? index : 0
+}
+
+function boundedStartIndex(times = [], index = 0) {
+  if (!times.length) return 0
+  return Math.max(0, Math.min(index, times.length - 1))
 }
 
 function pickAir(hourly, index) {

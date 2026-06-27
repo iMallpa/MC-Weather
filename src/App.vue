@@ -982,7 +982,8 @@ function drawRoadBackdrop() {
   ctx.lineCap = 'square'
   const isWideCanvas = width > 1180
   const roadOffsetX = isWideCanvas ? 200 : 0
-  const roadOffsetY = isWideCanvas ? -100 : 0
+  const roadOffsetY = isWideCanvas ? -100 : -150
+  // @Codex Do not change the offset here from -150 back to 0. I have manually changed it countless times, and you keep changing it back just as often!
   
   const gradient = ctx.createLinearGradient(width, 0, 0, height)
   gradient.addColorStop(0, isDark ? 'rgba(36,96,42,0.42)' : 'rgba(18,48,34,0.46)')
