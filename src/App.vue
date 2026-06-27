@@ -67,7 +67,7 @@ const error = ref('')
 const minuteCanvas = ref(null)
 const hourlyCanvas = ref(null)
 const windCanvas = ref(null)
-const minuteTooltip = ref({ visible: false, chartId: '', x: 0, y: 0, title: '', items: [] })
+const minuteTooltip = ref({ visible: false, chartId: '', x: 0, y: 0, placement: 'right', title: '', items: [] })
 const roadCanvas = ref(null)
 const mapElement = ref(null)
 const roadWays = ref([])
@@ -77,6 +77,8 @@ let refreshTimer = 0
 let minuteChart = null
 let hourlyChart = null
 let windChart = null
+let licenseClickCount = 0
+let licenseClickTimer = 0
 let resizeObserver = null
 let leafletMap = null
 let baseLayer = null
@@ -371,6 +373,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearInterval(refreshTimer)
+  window.clearTimeout(licenseClickTimer)
   minuteChart?.destroy()
   hourlyChart?.destroy()
   windChart?.destroy()
@@ -388,6 +391,19 @@ function handleGlobalShortcut(event) {
     event.preventDefault()
     debugModalOpen.value = true
   }
+}
+
+function handleLicenseDebugClick() {
+  window.clearTimeout(licenseClickTimer)
+  licenseClickCount += 1
+  if (licenseClickCount >= 5) {
+    licenseClickCount = 0
+    debugModalOpen.value = true
+    return
+  }
+  licenseClickTimer = window.setTimeout(() => {
+    licenseClickCount = 0
+  }, 1500)
 }
 
 async function refreshWeather(place = selectedPlace.value) {
@@ -593,6 +609,14 @@ function chartValue(label, value) {
   return `${rounded(value, precision)} ${unit}`
 }
 
+function chartLegendText(label) {
+  return `${chartLabel(label)} ${chartUnit(label)}`
+}
+
+function chartFontFamily() {
+  return '"Minecraft Seven", "Noto Sans SC", "Microsoft YaHei", sans-serif'
+}
+
 function resizeChartCanvas(canvas, minHeight = 240) {
   const wrap = canvas?.parentElement
   if (!canvas || !wrap) return
@@ -622,11 +646,16 @@ function chartTooltip(chartId) {
 
       const rect = chart.canvas.getBoundingClientRect()
       const wrapRect = chart.canvas.parentElement.getBoundingClientRect()
+      const x = rect.left - wrapRect.left + tooltip.caretX
+      const y = rect.top - wrapRect.top + tooltip.caretY
+      const estimatedWidth = 174
+      const placement = x + estimatedWidth + 18 > wrapRect.width && x > estimatedWidth + 18 ? 'left' : 'right'
       minuteTooltip.value = {
         visible: true,
         chartId,
-        x: rect.left - wrapRect.left + tooltip.caretX,
-        y: rect.top - wrapRect.top + tooltip.caretY,
+        x,
+        y,
+        placement,
         title: tooltip.title?.[0] || '',
         items: points.map((point) => ({
           label: chartLabel(point.dataset.label),
@@ -652,7 +681,13 @@ function chartOptions(chartId, scales) {
           color: text,
           boxWidth: 16,
           boxHeight: 12,
-          font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' },
+          font: { family: chartFontFamily() },
+          generateLabels(chart) {
+            return Chart.defaults.plugins.legend.labels.generateLabels(chart).map((item) => ({
+              ...item,
+              text: chartLegendText(item.text),
+            }))
+          },
         },
       },
       tooltip: chartTooltip(chartId),
@@ -666,7 +701,7 @@ function chartOptions(chartId, scales) {
           maxRotation: 0,
           autoSkip: true,
           maxTicksLimit: 8,
-          font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' },
+          font: { family: chartFontFamily() },
         },
         grid: { color: grid },
       },
@@ -680,7 +715,7 @@ function tempAxis() {
   return {
     type: 'linear',
     axis: 'y',
-    ticks: { color: text, font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' } },
+    ticks: { color: text, font: { family: chartFontFamily() } },
     grid: { color: grid },
   }
 }
@@ -692,7 +727,7 @@ function secondaryAxis(position = 'right') {
     axis: 'y',
     position,
     beginAtZero: true,
-    ticks: { color: text, font: { family: 'Noto Sans SC, Microsoft YaHei, Minecraft Seven, sans-serif' } },
+    ticks: { color: text, font: { family: chartFontFamily() } },
     grid: { drawOnChartArea: false },
   }
 }
@@ -1423,6 +1458,7 @@ function rounded(value, digits = 0) {
             <div
               v-if="minuteTooltip.visible && minuteTooltip.chartId === 'minute'"
               class="chart-tooltip-panel"
+              :class="{ 'is-left': minuteTooltip.placement === 'left' }"
               :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
             >
               <strong>{{ minuteTooltip.title }}</strong>
@@ -1441,6 +1477,7 @@ function rounded(value, digits = 0) {
             <div
               v-if="minuteTooltip.visible && minuteTooltip.chartId === 'hourly'"
               class="chart-tooltip-panel"
+              :class="{ 'is-left': minuteTooltip.placement === 'left' }"
               :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
             >
               <strong>{{ minuteTooltip.title }}</strong>
@@ -1458,6 +1495,7 @@ function rounded(value, digits = 0) {
             <div
               v-if="minuteTooltip.visible && minuteTooltip.chartId === 'wind'"
               class="chart-tooltip-panel"
+              :class="{ 'is-left': minuteTooltip.placement === 'left' }"
               :style="{ left: `${minuteTooltip.x}px`, top: `${minuteTooltip.y}px` }"
             >
               <strong>{{ minuteTooltip.title }}</strong>
@@ -1669,7 +1707,7 @@ function rounded(value, digits = 0) {
               </svg>
               <span>View source on GitHub</span>
             </a>
-            <span class="footer-license">
+            <span class="footer-license" @click="handleLicenseDebugClick">
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" aria-hidden="true">
                 <path d="M80-120v-80h360v-447q-26-9-45-28t-28-45H240l120 280q0 50-41 85t-99 35q-58 0-99-35t-41-85l120-280h-80v-80h247q12-35 43-57.5t70-22.5q39 0 70 22.5t43 57.5h247v80h-80l120 280q0 50-41 85t-99 35q-58 0-99-35t-41-85l120-280H593q-9 26-28 45t-45 28v447h360v80H80Zm585-320h150l-75-174-75 174Zm-520 0h150l-75-174-75 174Zm335-280q17 0 28.5-11.5T520-760q0-17-11.5-28.5T480-800q-17 0-28.5 11.5T440-760q0 17 11.5 28.5T480-720Z" />
               </svg>
